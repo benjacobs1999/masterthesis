@@ -35,13 +35,14 @@ print(f"Running on {DEVICE}")
 
 def train_PDL(data, args, save_dir):
     K = 10
-    # L = 500
-    L = 500 # for testing
+    L = 500
+    # L = 1 # for testing
     tau = 0.8
     rho = 0.5
     rho_max = 5000
     alpha = 10
-    batch_size = args['batchSize']
+    batch_size = 200
+    hidden_size = 500
 
     train_dataset = TensorDataset(data.trainX.to(DEVICE))
     valid_dataset = TensorDataset(data.validX.to(DEVICE))
@@ -51,8 +52,8 @@ def train_PDL(data, args, save_dir):
     valid_loader = DataLoader(valid_dataset, batch_size=len(valid_dataset))
     test_loader = DataLoader(test_dataset, batch_size=len(test_dataset))
 
-    primal_net = PrimalNet(data, args).to(dtype=torch.float32, device=DEVICE)
-    dual_net = DualNet(data, args).to(dtype=torch.float32, device=DEVICE)
+    primal_net = PrimalNet(data, hidden_size).to(dtype=torch.float32, device=DEVICE)
+    dual_net = DualNet(data, hidden_size).to(dtype=torch.float32, device=DEVICE)
 
     primal_optim = torch.optim.Adam(primal_net.parameters(), lr=1e-4)
     dual_optim = torch.optim.Adam(dual_net.parameters(), lr=1e-4)
@@ -70,7 +71,7 @@ def train_PDL(data, args, save_dir):
                 primal_optim.zero_grad()
                 y = primal_net(Xtrain)
                 mu, lamb = frozen_dual_net(Xtrain)
-                train_loss = primal_loss(data, Xtrain, y, mu, lamb, rho, args)
+                train_loss = primal_loss(data, Xtrain, y, mu, lamb, rho)
                 train_loss.sum().backward()
                 primal_optim.step()
                 train_time = time.time() - start_time
@@ -93,7 +94,7 @@ def train_PDL(data, args, save_dir):
                 mu, lamb = dual_net(Xtrain)
                 mu_k, lamb_k = frozen_dual_net(Xtrain)
                 y = frozen_primal_net(Xtrain)
-                train_loss = dual_loss(data, Xtrain, y, mu, lamb, mu_k, lamb_k, rho, args)
+                train_loss = dual_loss(data, Xtrain, y, mu, lamb, mu_k, lamb_k, rho)
                 train_loss.sum().backward()
                 dual_optim.step()
                 train_time = time.time() - start_time
@@ -126,17 +127,17 @@ def train_PDL(data, args, save_dir):
             eval_pdl(data, Xtest, primal_net, args, 'test', epoch_stats)
 
         stats = epoch_stats
+        print()
         print(
-            'Epoch {}: train loss primal {:.4f}, train loss dual {:.4f}, obj. value {:.4f},'.format(
-                k, np.mean(epoch_stats['train_loss_primal']), np.mean(epoch_stats['train_loss_dual']), np.mean(epoch_stats['valid_eval']))
+            '{}: p-loss: {:.4f}, d-loss: {:.4f}, obj. val {:.4f}, ineq max: {:.4f}, ineq mean: {:.4f}, eq max: {:.4f}, eq mean: {:.4f}'.format(
+                k, np.mean(epoch_stats['train_loss_primal']),
+                np.mean(epoch_stats['train_loss_dual']),
+                np.mean(epoch_stats['valid_eval']),
+                np.mean(epoch_stats['valid_ineq_max']),
+                np.mean(epoch_stats['valid_ineq_mean']),
+                np.mean(epoch_stats['valid_eq_max']),
+                np.mean(epoch_stats['valid_eq_mean']))
         )
-        # print(
-        #     'Epoch {}: train loss primal {:.4f}, train loss dual {:.4f}, eval {:.4f}, dist {:.4f}, ineq max {:.4f}, ineq mean {:.4f}, ineq num viol {:.4f}, eq max {:.4f}, time {:.4f}'.format(
-        #         k, np.mean(epoch_stats['train_loss_primal']), np.mean(epoch_stats['train_loss_dual']), np.mean(epoch_stats['valid_eval']),
-        #         np.mean(epoch_stats['valid_dist']), np.mean(epoch_stats['valid_ineq_max']),
-        #         np.mean(epoch_stats['valid_ineq_mean']), np.mean(epoch_stats['valid_ineq_num_viol_0']),
-        #         np.mean(epoch_stats['valid_eq_max']), np.mean(epoch_stats['valid_time'])))
-
     with open(os.path.join(save_dir, 'stats.dict'), 'wb') as f:
         pickle.dump(stats, f)
     with open(os.path.join(save_dir, 'primal_net.dict'), 'wb') as f:
@@ -146,7 +147,7 @@ def train_PDL(data, args, save_dir):
 
     return primal_net, dual_net, stats
 
-def primal_loss(data, X, y, mu, lamb, rho, args):
+def primal_loss(data, X, y, mu, lamb, rho):
     obj = data.pdl_obj_fn(y)
     # g(y)
     ineq = data.pdl_g(X, y)
@@ -161,7 +162,7 @@ def primal_loss(data, X, y, mu, lamb, rho, args):
 
     return obj + lagrange_ineq + lagrange_eq + penalty
 
-def dual_loss(data, X, y, mu, lamb, mu_k, lamb_k, rho, args):
+def dual_loss(data, X, y, mu, lamb, mu_k, lamb_k, rho):
     # g(y)
     ineq = data.pdl_g(X, y)
     # h(y)
@@ -232,6 +233,7 @@ def eval_pdl(data, X, primal_net, args, prefix, stats):
 
     dict_agg(stats, make_prefix('time'), time.time() - start_time, op='sum')
     # dict_agg(stats, make_prefix('steps'), np.array([steps]))
+    # TODO: Change to correct loss function.
     dict_agg(stats, make_prefix('loss'), softloss(data, X, Y, args).detach().cpu().numpy())
     dict_agg(stats, make_prefix('eval'), data.obj_fn(Ycorr).detach().cpu().numpy())
     dict_agg(stats, make_prefix('dist'), torch.norm(Ycorr - Y, dim=1).detach().cpu().numpy())
@@ -276,11 +278,11 @@ def eval_pdl(data, X, primal_net, args, prefix, stats):
     return stats
 
 class PrimalNet(nn.Module):
-    def __init__(self, data, args):
+    def __init__(self, data, hidden_size):
         super().__init__()
         self._data = data
-        self._args = args
-        layer_sizes = [data.xdim, self._args['hiddenSize'], self._args['hiddenSize']]
+        self._hidden_size = hidden_size
+        layer_sizes = [data.xdim, self._hidden_size, self._hidden_size]
         layers = []
         for in_size, out_size in zip(layer_sizes[:-1], layer_sizes[1:]):
             layers.append(nn.Linear(in_size, out_size))
@@ -297,12 +299,12 @@ class PrimalNet(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-class DualNet(nn.Module):
-    def __init__(self, data, args):
+class DualNetTwoOutputLayers(nn.Module):
+    def __init__(self, data, hidden_size):
         super().__init__()
         self._data = data
-        self._args = args
-        layer_sizes = [data.xdim, self._args['hiddenSize'], self._args['hiddenSize']]
+        self._hidden_size = hidden_size
+        layer_sizes = [data.xdim, self._hidden_size, self._hidden_size]
         layers = []
         for in_size, out_size in zip(layer_sizes[:-1], layer_sizes[1:]):
             layers.append(nn.Linear(in_size, out_size))
@@ -312,8 +314,8 @@ class DualNet(nn.Module):
                 nn.init.kaiming_normal_(layer.weight)
         # mu_k = np.zeros(self.G_np.shape[0])  # (50,)
         # lamb_k = np.zeros(self.A_np.shape[0])  # (50,)
-        self.out_layer_mu = nn.Linear(self._args['hiddenSize'], data.G.shape[0])
-        self.out_layer_lamb = nn.Linear(self._args['hiddenSize'], data.A.shape[0])
+        self.out_layer_mu = nn.Linear(self._hidden_size, data.G.shape[0])
+        self.out_layer_lamb = nn.Linear(self._hidden_size, data.A.shape[0])
         # Init last layers as 0, like in the paper
         nn.init.zeros_(self.out_layer_mu.weight)
         nn.init.zeros_(self.out_layer_lamb.weight)
@@ -323,6 +325,34 @@ class DualNet(nn.Module):
         out = self.net(x)
         out_mu = self.out_layer_mu(out)
         out_lamb = self.out_layer_lamb(out)
+        return out_mu, out_lamb
+    
+class DualNet(nn.Module):
+    def __init__(self, data, hidden_size):
+        super().__init__()
+        self._data = data
+        self._hidden_size = hidden_size
+        layer_sizes = [data.xdim, self._hidden_size, self._hidden_size]
+        layers = []
+        for in_size, out_size in zip(layer_sizes[:-1], layer_sizes[1:]):
+            layers.append(nn.Linear(in_size, out_size))
+            layers.append(nn.ReLU())
+        for layer in layers:
+            if type(layer) == nn.Linear:
+                nn.init.kaiming_normal_(layer.weight)
+        # output layer = [mu, lamb]
+        self.out_layer = nn.Linear(self._hidden_size, self._data.G.shape[0] + self._data.A.shape[0])
+        # Init last layers as 0, like in the paper
+        nn.init.zeros_(self.out_layer.weight)
+        layers += [self.out_layer]
+        self.net = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        out = self.net(x)
+        # out_mu = self.out_layer_mu(out)
+        # out_lamb = self.out_layer_lamb(out)
+        out_mu = out[:, :self._data.G.shape[0]]
+        out_lamb = out[:, self._data.A.shape[0]:]
         return out_mu, out_lamb
 
 def main():

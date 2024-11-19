@@ -195,41 +195,21 @@ def main():
             )
             if not os.path.exists(save_dir):
                 os.makedirs(save_dir)
-            Yvalid_opt, valid_time_total, valid_time_parallel = data.ALM_solve(
-                data.validX
+            # cProfile.run("data.ALM_solve(data.validX[:1])")
+            Yvalid_opt, valid_time_total, valid_time_parallel = data.alpaqa_solve(
+                data.validX[:1]
             )
-            Ytest_opt, test_time_total, test_time_parallel = data.ALM_solve(data.testX)
+            Ytest_opt, test_time_total, test_time_parallel = data.alpaqa_solve(data.testX[:1])
             opt_results = get_opt_results(
                 data,
                 torch.tensor(Yvalid_opt).to(DEVICE),
                 torch.tensor(Ytest_opt).to(DEVICE),
             )
-            print("ALM")
-            print(f"test eval: {opt_results['test_eval']}")
-            # print(opt_results['test_ineq_max'])
+            print(opt_results['test_eval'])
+            print(opt_results['test_ineq_max'])
             # print(opt_results['test_eq_max'])
-
-            # print(opt_results['test_ineq_mean'])
-            ### ALPAQA ######
-            # Yvalid_opt, valid_time_total, valid_time_parallel = data.alpaqa_solve(
-            #     data.validX
-            # )
-            # Ytest_opt, test_time_total, test_time_parallel = data.alpaqa_solve(data.testX)
-            # print("alpaqa")
-            # opt_results = get_opt_results(
-            #     data,
-            #     torch.tensor(Yvalid_opt).to(DEVICE),
-            #     torch.tensor(Ytest_opt).to(DEVICE),
-            # )
-            # print(Ytest_opt.shape)
-            # print(f"test eval: {opt_results['test_eval']}")
-            # print(f"test eval mean: {np.mean(opt_results['test_eval'])}")
-            # print(opt_results['test_ineq_max'])
-            # print(opt_results['test_eq_max'])
-            # print(opt_results['test_ineq_mean'])
+            print(opt_results['test_ineq_mean'])
             # print(opt_results['test_eq_mean'])
-
-            #### ALM code again ####
             opt_results.update(
                 dict(
                     [

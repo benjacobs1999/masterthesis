@@ -17,6 +17,13 @@ from copy import deepcopy
 import scipy.io as spio
 import time
 
+from concurrent.futures import ProcessPoolExecutor
+
+# For alpaqa:
+import casadi as cs
+import alpaqa as pa
+# from alpaqa import minimize
+
 # from pypower.api import case57
 # from pypower.api import opf, makeYbus
 # from pypower import idx_bus, idx_gen, ppoption
@@ -358,10 +365,11 @@ class SimpleProblem:
                 + np.linalg.norm(eq_resid, 2) ** 2
             )
         )
-
-    def ALM_solve(self, X, tol=1e-4):
-        X_np = X.detach().cpu().numpy() if hasattr(X, "detach") else X
-
+    
+    def solve_instance(self, i, Xi, tol=1e-4):
+        """
+        Solve ALM for a single instance.
+        """
         mu_k = np.zeros(self.G_np.shape[0])  # (50,)
         lamb_k = np.zeros(self.A_np.shape[0])  # (50,)
         rho = 1.0
@@ -371,58 +379,210 @@ class SimpleProblem:
 
         epsilon = 1e-4
         rho_max = 5000
+        # print(f"sample {i+1} of {833}")
+        start_time = time.time()
+        # Initial primal point
+        Yi = np.random.uniform(-1, 1, 100)  # Shape (100,)
 
-        Y = []  # Store solutions for each instance
+        for k in range(K):
+            # Minimize L_rho for current `mu_k` and `lambda_k`
+            res = scipy.optimize.minimize(
+                fun=self.L_rho,
+                x0=Yi,
+                args=(Xi, mu_k, lamb_k, rho),
+                tol=tol,
+                method="CG",
+            )
+            y_k = res.x  # Solution for this iteration, shape (100,)
+
+            # Update dual variables using y_k
+            mu_k = np.maximum(mu_k + rho * self.ineq_resid_ALM(y_k, Xi), 0)
+            lamb_k = lamb_k + rho * self.eq_resid_ALM(y_k, Xi)
+
+            # Calculate v_k to check for convergence
+            inf_norm_eq_resid = np.max(np.abs(self.eq_resid_ALM(y_k, Xi)))
+            sigma = np.maximum(self.ineq_resid_ALM(y_k, Xi), -lamb_k / rho)
+            inf_norm_sigma = np.max(np.abs(sigma))
+            v_k = max(inf_norm_eq_resid, inf_norm_sigma)
+
+            if v_k < epsilon:
+                print(f"Converged for instance {i+1} at iteration {k+1}")
+                break
+
+            if k >= 1 and v_k > (tau * prev_v_k):
+                rho = min(alpha * rho, rho_max)
+            prev_v_k = v_k
+            Yi = y_k  # Use the current solution as the initial guess for the next iteration
+
+        end_time = time.time()
+        print(self.obj_fn_ALM(y_k))
+        return y_k, end_time - start_time
+
+    def ALM_solve(self, X, tol=1e-4):
+        X_np = X.detach().cpu().numpy() if hasattr(X, "detach") else X
+
+        # Parallel processing
+        with ProcessPoolExecutor() as executor:
+            results = list(executor.map(self.solve_instance, range(len(X_np)), X_np))
+
+        # Unpack results
+        Y, times = zip(*results)
+        total_time = sum(times)
+        parallel_time = total_time / len(X_np)
+        sols = np.array(Y)
+
+        return sols, total_time, parallel_time
+
+
+    # def ALM_solve(self, X, tol=1e-4):
+    #     X_np = X.detach().cpu().numpy() if hasattr(X, "detach") else X
+
+    #     Y = []  # Store solutions for each instance
+    #     total_time = 0
+
+    #     print("running ALM")
+    #     for i in range(len(X_np)):
+    #         mu_k = np.zeros(self.G_np.shape[0])  # (50,)
+    #         lamb_k = np.zeros(self.A_np.shape[0])  # (50,)
+    #         rho = 1.0
+    #         tau = 0.5
+    #         alpha = 10
+    #         K = 20
+
+    #         epsilon = 1e-4
+    #         rho_max = 5000
+    #         print(f"sample {i+1} of 10000")
+    #         start_time = time.time()
+    #         Xi = X_np[i]  # Shape (50,)
+    #         # The initial primal point is randomly sampled from the uniform distribution over [−1, 1].
+    #         Yi = np.random.uniform(
+    #             -1, 1, 100
+    #         )  # Initial guess for this instance, shape (100,)
+
+    #         for k in range(K):
+    #             # Minimize L_rho for current `mu_k` and `lambda_k`
+    #             res = scipy.optimize.minimize(
+    #                 fun=self.L_rho,
+    #                 x0=Yi,
+    #                 args=(Xi, mu_k, lamb_k, rho),
+    #                 tol=tol,
+    #                 method="CG",
+    #             )
+    #             y_k = res.x  # Solution for this iteration, shape (100,)
+
+    #             # Update dual variables using y_k
+    #             mu_k = np.maximum(mu_k + rho * self.ineq_resid_ALM(y_k, Xi), 0)
+    #             lamb_k = lamb_k + rho * self.eq_resid_ALM(y_k, Xi)
+
+    #             # Calculate v_k to check for convergence
+    #             inf_norm_eq_resid = np.max(np.abs(self.eq_resid_ALM(y_k, Xi)))
+    #             sigma = np.maximum(self.ineq_resid_ALM(y_k, Xi), -lamb_k / rho)
+    #             inf_norm_sigma = np.max(np.abs(sigma))
+    #             v_k = max(inf_norm_eq_resid, inf_norm_sigma)
+
+    #             if v_k < epsilon:
+    #                 print(f"Converged for instance {i+1} at iteration {k+1}")
+    #                 break
+
+    #             if i >= 1 and v_k > (tau * prev_v_k):
+    #                 rho = min(alpha * rho, rho_max)
+    #             prev_v_k = v_k
+    #             Yi = y_k  # Use the current solution as the initial guess for the next iteration
+
+    #         Y.append(y_k)
+    #         print(self.obj_fn_ALM(y_k))
+    #         end_time = time.time()
+    #         total_time += end_time - start_time
+
+    #     parallel_time = total_time / len(X_np)
+    #     sols = np.array(Y)  # Final solutions for all instances
+
+    #     return sols, total_time, parallel_time
+    
+    #! My Alpaqa functions
+    def alpaqa_solve(self, X,):
+        """     minimize_y 1/2 * y^T Q y + p^Ty
+                s.t.       Ay =  x
+                           Gy <= h"""
+        # X.shape = num_samples, 50
+        # G.shape = 50, 100
+        # Y.shape = 10000 (num_samples), 100
+        # y.shape = 100,
+        # Q.shape = 100, 100
+        # p.shape = 100,
+        # A.shape = 50, 100
+        sols = []
+
+        # Ensure X is a NumPy array
+        X = X.detach().cpu().numpy()
+
+        # Decision variable
+        y = cs.SX.sym("y", 100)  # y is a 100-dimensional decision vector
+
+        # Symbolic parameter for x (batch input)
+        x_param = cs.SX.sym("x_param", 50)  # Equality constraint RHS
+
+        Q = cs.DM(self.Q_np)   # Quadratic cost matrix
+        p = cs.DM(self.p_np)   # Linear cost vector
+        A = cs.DM(self.A_np)   # Equality constraint matrix
+        # x = cs.DM(Xi)        # Equality constraint RHS
+        G = cs.DM(self.G_np)   # Inequality constraint matrix
+        h = cs.DM(self.h_np)   # Inequality constraint RHS
+
+        # Objective function
+        f = 0.5 * cs.mtimes(y.T, cs.mtimes(Q, y)) + cs.mtimes(p.T, y)
+
+        # Constraints
+        g_eq = cs.mtimes(A, y) - x_param  # Equality: Ay = x
+        g_ineq = cs.mtimes(G, y) - h  # Inequality: Gy <= h
+        g = cs.vertcat(g_eq, g_ineq)  # Combine equality and inequality constraints
+
+        # Define the bounds
+        lb_y = [-cs.inf] * 100  # No lower bounds on y
+        ub_y = [cs.inf] * 100   # No upper bounds on y
+
+        C = lb_y, ub_y
+
+        lb_g = [0] * 50 + [-cs.inf] * 50
+        ub_g = [0] * 100
+        
+        D = lb_g, ub_g
+
+        problem = (
+            pa.minimize(f, y)               # Objective function
+            .subject_to_box(C)   # Box constraints on y
+            .subject_to(g, D)  # General constraints on g
+            .with_param(x_param)
+        ).compile()
+
+        inner_solver = pa.PANOCSolver()
+        solver = pa.ALMSolver(
+            alm_params={
+                'tolerance': 1e-4,
+                'dual_tolerance': 1e-4,
+                'initial_penalty': 1.0,
+                'penalty_update_factor': 10,
+            },
+            inner_solver=inner_solver,
+        )
+
+        # x_sol, _, _ = solver(problem)
+        
+        sols = []
         total_time = 0
-
-        print("running ALM")
-        for i in range(len(X_np)):
-            print(f"sample {i+1} of 10000")
+        for Xi in X:
             start_time = time.time()
-            Xi = X_np[i]  # Shape (50,)
-            # The initial primal point is randomly sampled from the uniform distribution over [−1, 1].
-            Yi = np.random.uniform(
-                -1, 1, 100
-            )  # Initial guess for this instance, shape (100,)
-
-            for k in range(K):
-                # Minimize L_rho for current `mu_k` and `lambda_k`
-                res = scipy.optimize.minimize(
-                    fun=self.L_rho,
-                    x0=Yi,
-                    args=(Xi, mu_k, lamb_k, rho),
-                    tol=tol,
-                    method="CG",
-                )
-                y_k = res.x  # Solution for this iteration, shape (100,)
-
-                # Update dual variables using y_k
-                mu_k = np.maximum(mu_k + rho * self.ineq_resid_ALM(y_k, Xi), 0)
-                lamb_k = lamb_k + rho * self.eq_resid_ALM(y_k, Xi)
-
-                # Calculate v_k to check for convergence
-                inf_norm_eq_resid = np.max(np.abs(self.eq_resid_ALM(y_k, Xi)))
-                sigma = np.maximum(self.ineq_resid_ALM(y_k, Xi), -lamb_k / rho)
-                inf_norm_sigma = np.max(np.abs(sigma))
-                v_k = max(inf_norm_eq_resid, inf_norm_sigma)
-
-                if v_k < epsilon:
-                    print(f"Converged for instance {i+1} at iteration {k+1}")
-                    break
-
-                if i >= 1 and v_k > (tau * prev_v_k):
-                    rho = min(alpha * rho, rho_max)
-                prev_v_k = v_k
-                Yi = y_k  # Use the current solution as the initial guess for the next iteration
-
-            Y.append(y_k)
+            problem.param = Xi
+            x_sol, _, _ = solver(problem)  # Pass current Xi as x_param
+            sols.append(x_sol)
+        
             end_time = time.time()
             total_time += end_time - start_time
 
-        parallel_time = total_time / len(X_np)
-        sols = np.array(Y)  # Final solutions for all instances
+        parallel_time = total_time / len(X)
 
-        return sols, total_time, parallel_time
+        return np.array(sols), total_time, parallel_time
+
     
     #! My PDL functions
     def pdl_obj_fn(self, Y):
