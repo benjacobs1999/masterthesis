@@ -41,7 +41,8 @@ def train_PDL(data, args, save_dir):
     rho = 0.5
     rho_max = 5000
     alpha = 10
-    batch_size = 200
+    # batch_size = 200
+    batch_size = 1000 # For testing
     hidden_size = 500
 
     train_dataset = TensorDataset(data.trainX.to(DEVICE))
@@ -53,17 +54,30 @@ def train_PDL(data, args, save_dir):
     test_loader = DataLoader(test_dataset, batch_size=len(test_dataset))
 
     primal_net = PrimalNet(data, hidden_size).to(dtype=torch.float32, device=DEVICE)
-    dual_net = DualNet(data, hidden_size).to(dtype=torch.float32, device=DEVICE)
+    dual_net = DualNetTwoOutputLayers(data, hidden_size).to(dtype=torch.float32, device=DEVICE)
 
-    primal_optim = torch.optim.Adam(primal_net.parameters(), lr=1e-4)
-    dual_optim = torch.optim.Adam(dual_net.parameters(), lr=1e-4)
+    primal_lr = 1e-3
+    dual_lr = 1e-3
+    decay = 0.99
+    patience = 10
 
+    primal_optim = torch.optim.Adam(primal_net.parameters(), lr=primal_lr)
+    dual_optim = torch.optim.Adam(dual_net.parameters(), lr=dual_lr)
+
+    # Add schedulers
+    primal_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        primal_optim, mode='min', factor=decay, patience=patience
+    )
+    dual_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        dual_optim, mode='min', factor=decay, patience=patience
+    )
     for k in range(K):
+        begin_time = time.time()
         epoch_stats = {}
         frozen_dual_net = copy.deepcopy(dual_net)
+        frozen_dual_net.eval()
 
         for l1 in range(L):
-            # print(f"outer: {k+1}/{K}, primal:{l1+1}/{L}, primal:{0}/{L}")
             # Update primal net using primal loss
             for Xtrain in train_loader:
                 Xtrain = Xtrain[0].to(DEVICE)
@@ -72,20 +86,36 @@ def train_PDL(data, args, save_dir):
                 y = primal_net(Xtrain)
                 mu, lamb = frozen_dual_net(Xtrain)
                 train_loss = primal_loss(data, Xtrain, y, mu, lamb, rho)
-                train_loss.sum().backward()
+                # train_loss.sum().backward()
+                train_loss.mean().backward()
                 primal_optim.step()
                 train_time = time.time() - start_time
-                # dict_agg(epoch_stats, 'train_loss', train_loss.detach().cpu().numpy())
-                # dict_agg(epoch_stats, 'train_time', train_time, op='sum')
+
+            # Evaluate validation loss every epoch, and update learning rate
+            curr_val_loss = 0
+            primal_net.eval()
+            for Xvalid in valid_loader:
+                Xvalid = Xvalid[0].to(DEVICE)
+                y = primal_net(Xvalid)
+                mu, lamb = frozen_dual_net(Xvalid)
+                loss = primal_loss(data, Xvalid, y, mu, lamb, rho).sum()
+                curr_val_loss += loss
+            curr_val_loss /= len(valid_loader)
+            # Normalize by rho, so that the schedular still works correctly if rho is increased
+            primal_scheduler.step(torch.sign(curr_val_loss) * (torch.abs(curr_val_loss) / rho))
         
         dict_agg(epoch_stats, 'train_loss_primal', train_loss.detach().cpu().numpy())
-        
-        # Calculate v_k
 
-        # Copy dual net into dual_net_k
+        # Copy primal net into frozen primal net
         frozen_primal_net = copy.deepcopy(primal_net)
+        frozen_primal_net.eval()
+
+        # Calculate v_k
+        y = frozen_primal_net(data.trainX.to(DEVICE))
+        mu_k, lamb_k = frozen_dual_net(data.trainX.to(DEVICE))
+        v_k = violation(data, data.trainX.to(DEVICE), y, lamb_k, rho)
+
         for l2 in range(L):
-            # print(f"outer: {k+1}/{K}, primal:{l1+1}/{L}, primal:{l2+1}/{L}")
             # Update dual net using dual loss
             for Xtrain in train_loader:
                 Xtrain = Xtrain[0].to(DEVICE)
@@ -95,23 +125,25 @@ def train_PDL(data, args, save_dir):
                 mu_k, lamb_k = frozen_dual_net(Xtrain)
                 y = frozen_primal_net(Xtrain)
                 train_loss = dual_loss(data, Xtrain, y, mu, lamb, mu_k, lamb_k, rho)
-                train_loss.sum().backward()
+                # train_loss.sum().backward()
+                train_loss.mean().backward()
                 dual_optim.step()
-                train_time = time.time() - start_time
-                # dict_agg(epoch_stats, 'train_loss', train_loss.detach().cpu().numpy())
-                # dict_agg(epoch_stats, 'train_time', train_time, op='sum')
+
+            # Evaluate validation loss every epoch, and update learning rate
+            dual_net.eval()
+            curr_val_loss = 0
+            for Xvalid in valid_loader:
+                Xvalid = Xvalid[0].to(DEVICE)
+                y = frozen_primal_net(Xvalid)
+                mu, lamb = dual_net(Xvalid)
+                mu_k, lamb_k = frozen_dual_net(Xvalid)
+                curr_val_loss += dual_loss(data, Xvalid, y, mu, lamb, mu_k, lamb_k, rho).sum()
+            
+            curr_val_loss /= len(valid_loader)
+            # Normalize by rho, so that the schedular still works correctly if rho is increased
+            dual_scheduler.step(torch.sign(curr_val_loss) * (torch.abs(curr_val_loss) / rho))
 
         dict_agg(epoch_stats, 'train_loss_dual', train_loss.detach().cpu().numpy())
-
-        # Calculate v_k for the entire training dataset
-        y = primal_net(data.trainX.to(DEVICE))
-        mu_k, lamb_k = dual_net(data.trainX.to(DEVICE))
-        v_k = violation(data, data.trainX.to(DEVICE), y, lamb_k, rho)
-        
-        # Update rho from the second iteration onward.
-        if k > 0 and v_k > tau * prev_v_k:
-            rho = min(alpha * rho, rho_max)
-        prev_v_k = v_k
 
         ##### Evaluate #####
         # Get valid loss
@@ -121,23 +153,30 @@ def train_PDL(data, args, save_dir):
             eval_pdl(data, Xvalid, primal_net, args, 'valid', epoch_stats)
 
         # Get test loss
-        primal_net.eval()
-        for Xtest in test_loader:
-            Xtest = Xtest[0].to(DEVICE)
-            eval_pdl(data, Xtest, primal_net, args, 'test', epoch_stats)
+        # primal_net.eval()
+        # for Xtest in test_loader:
+        #     Xtest = Xtest[0].to(DEVICE)
+        #     eval_pdl(data, Xtest, primal_net, args, 'test', epoch_stats)
 
+        end_time = time.time()
         stats = epoch_stats
-        print()
+        print(f"Epoch {k} done. Time taken: {end_time - begin_time}. Rho: {rho}. Primal LR: {primal_optim.param_groups[0]['lr']}, Dual LR: {dual_optim.param_groups[0]['lr']}")
         print(
-            '{}: p-loss: {:.4f}, d-loss: {:.4f}, obj. val {:.4f}, ineq max: {:.4f}, ineq mean: {:.4f}, eq max: {:.4f}, eq mean: {:.4f}'.format(
+            '{}: p-loss: {:.4f}, d-loss: {:.4f}, obj. val {:.4f}, Max eq.: {:.4f}, Max ineq.: {:.4f}, Mean eq.: {:.4f}, Mean ineq.: {:.4f}\n'.format(
                 k, np.mean(epoch_stats['train_loss_primal']),
                 np.mean(epoch_stats['train_loss_dual']),
                 np.mean(epoch_stats['valid_eval']),
-                np.mean(epoch_stats['valid_ineq_max']),
-                np.mean(epoch_stats['valid_ineq_mean']),
                 np.mean(epoch_stats['valid_eq_max']),
-                np.mean(epoch_stats['valid_eq_mean']))
+                np.mean(epoch_stats['valid_ineq_max']),
+                np.mean(epoch_stats['valid_eq_mean']),
+                np.mean(epoch_stats['valid_ineq_mean']))
         )
+
+        # Update rho from the second iteration onward.
+        if k > 0 and v_k > tau * prev_v_k:
+            rho = np.min([alpha * rho, rho_max])
+        prev_v_k = v_k
+
     with open(os.path.join(save_dir, 'stats.dict'), 'wb') as f:
         pickle.dump(stats, f)
     with open(os.path.join(save_dir, 'primal_net.dict'), 'wb') as f:
@@ -147,17 +186,20 @@ def train_PDL(data, args, save_dir):
 
     return primal_net, dual_net, stats
 
+
+
 def primal_loss(data, X, y, mu, lamb, rho):
     obj = data.pdl_obj_fn(y)
     # g(y)
     ineq = data.pdl_g(X, y)
     # h(y)
     eq = data.pdl_h(X, y)
-    # Lagrange multiplier terms (element-wise multiplication followed by sum along the constraint dimension)
+
     lagrange_ineq = torch.sum(mu * ineq, dim=1)  # Shape (batch_size,)
-    lagrange_eq = torch.sum(lamb * eq, dim=1)  # Shape (batch_size,)
+    lagrange_eq = torch.sum(lamb * eq, dim=1)   # Shape (batch_size,)
+
     violation_ineq = torch.sum(torch.maximum(ineq, torch.zeros_like(ineq)) ** 2, dim=1)
-    violation_eq = torch.sum(eq ** 2)
+    violation_eq = torch.sum(eq ** 2, dim=1)
     penalty = rho/2 * (violation_ineq + violation_eq)
 
     return obj + lagrange_ineq + lagrange_eq + penalty
@@ -180,25 +222,24 @@ def dual_loss(data, X, y, mu, lamb, mu_k, lamb_k, rho):
 
 def violation(data, X, y, lamb_k, rho):
     # Calculate the equality constraint function h_x(y)
-    eq = data.pdl_h(X, y)  # Assume shape (batch_size, n_eq)
+    eq = data.pdl_h(X, y)  # Assume shape (num_samples, n_eq)
     
     # Calculate the infinity norm of h_x(y)
-    eq_inf_norm = torch.norm(eq, p=float('inf'), dim=1)  # Shape: (batch_size,)
+    eq_inf_norm = torch.abs(eq).max(dim=1).values  # Shape: (num_samples,)
 
     # Calculate the inequality constraint function g_x(y)
-    eq = data.pdl_g(X, y)  # Assume shape (batch_size, n_ineq)
+    ineq = data.pdl_g(X, y)  # Assume shape (num_samples, n_ineq)
     
     # Calculate sigma_x(y) for each inequality constraint
-    sigma_y = torch.maximum(eq, -lamb_k / rho)  # Element-wise max
+    sigma_y = torch.maximum(ineq, -lamb_k / rho)  # Element-wise max
     
     # Calculate the infinity norm of sigma_x(y)
-    sigma_y_inf_norm = torch.norm(sigma_y, p=float('inf'), dim=1)  # Shape: (batch_size,)
+    sigma_y_inf_norm = torch.abs(sigma_y).max(dim=1).values  # Shape: (num_samples,)
 
     # Compute v_k as the maximum of the two norms
-    v_k = torch.maximum(eq_inf_norm, sigma_y_inf_norm)  # Shape: (batch_size,)
+    v_k = torch.maximum(eq_inf_norm, sigma_y_inf_norm)  # Shape: (num_samples,)
     
     return v_k.max().item()
-
 
 def softloss(data, X, Y, args):
     obj_cost = data.obj_fn(Y)
@@ -318,7 +359,10 @@ class DualNetTwoOutputLayers(nn.Module):
         self.out_layer_lamb = nn.Linear(self._hidden_size, data.A.shape[0])
         # Init last layers as 0, like in the paper
         nn.init.zeros_(self.out_layer_mu.weight)
+        nn.init.zeros_(self.out_layer_mu.bias)
         nn.init.zeros_(self.out_layer_lamb.weight)
+        nn.init.zeros_(self.out_layer_lamb.bias)
+
         self.net = nn.Sequential(*layers)
     
     def forward(self, x):
@@ -344,13 +388,12 @@ class DualNet(nn.Module):
         self.out_layer = nn.Linear(self._hidden_size, self._data.G.shape[0] + self._data.A.shape[0])
         # Init last layers as 0, like in the paper
         nn.init.zeros_(self.out_layer.weight)
+        nn.init.zeros_(self.out_layer.bias)
         layers += [self.out_layer]
         self.net = nn.Sequential(*layers)
     
     def forward(self, x):
         out = self.net(x)
-        # out_mu = self.out_layer_mu(out)
-        # out_lamb = self.out_layer_lamb(out)
         out_mu = out[:, :self._data.G.shape[0]]
         out_lamb = out[:, self._data.A.shape[0]:]
         return out_mu, out_lamb
