@@ -120,7 +120,7 @@ def resolve_nodes(dictionary: Dict[str, Any]) -> None:
     elif not isinstance(nodes, list) or not all(isinstance(n, str) for n in nodes):
         raise ValueError(f"Invalid type for nodes: {type(nodes)}. {WRONG_SET_MESSAGE}")
     
-    dictionary["nodes"] = list(nodes)
+    dictionary["nodes"] = list(sorted(nodes))
 
 def resolve_generators(dictionary: Dict[str, Any]) -> None:
     generators = dictionary[GENERATORS_KEY]
@@ -138,7 +138,7 @@ def resolve_generators(dictionary: Dict[str, Any]) -> None:
     elif not (isinstance(generators, list) and all(isinstance(pair, tuple) and len(pair) == 2 for pair in generators)):
         raise ValueError(f"Invalid type for generators: {type(generators)}. {WRONG_SET_MESSAGE}")
 
-    dictionary["generators"] = list(generators)
+    dictionary["generators"] = list(sorted(generators))
 
 def resolve_transmission_lines(dictionary: Dict[str, Any]) -> None:
     lines = dictionary[TRANSMISSION_KEY]
@@ -152,7 +152,7 @@ def resolve_transmission_lines(dictionary: Dict[str, Any]) -> None:
     elif not (isinstance(lines, list) and all(isinstance(pair, tuple) and len(pair) == 2 for pair in lines)):
         raise ValueError(f"Invalid type for transmission_lines: {type(lines)}. {WRONG_SET_MESSAGE}")
 
-    dictionary["transmission_lines"] = list(lines)
+    dictionary["transmission_lines"] = list(sorted(lines))
 
 def resolve_sets(dictionary: Dict[str, Any]) -> None:
     resolve_times(dictionary)

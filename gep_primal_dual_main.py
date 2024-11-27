@@ -2,9 +2,9 @@ import pickle
 import time
 from gep_config_parser import *
 from data_wrangling import dataframe_to_dict
-import pyomo.environ as pyo
 
-from primal_dual import GEPProblem, train_PDL
+from primal_dual import train_PDL
+from gep_problem import GEPProblem
 
 CONFIG_FILE_NAME        = "config.toml"
 VISUALIZATION_FILE_NAME = "visualization.toml"
@@ -24,13 +24,17 @@ def run_model(inputs, args):
     print("Wrangling the input data")
 
     # Extract sets
-    T = inputs["times"] # [1, 2, 3, ... 8761] ---> 8761
+    T = inputs["times"] # [1, 2, 3, ... 8760] ---> 8760
     G = inputs["generators"] # [('Country1', 'EnergySource1'), ...] ---> 107
     L = inputs["transmission_lines"] # [('Country1', 'Country2'), ...] ---> 44
     N = inputs["nodes"] # ['Country1', 'Country2', ...] ---> 20
 
-    SCALE_TIMES = 0.01
-    T = range(1, int(SCALE_TIMES*len(T)))
+    original_len_T = len(T)
+    samples = 10
+    # samples = 8760
+    # 10 samples
+    T = range(1, 1+samples)
+    N = ['BEL', 'FRA', 'GER', 'NED']
 
     # Extract time series data
     pDemand = dataframe_to_dict(
@@ -49,7 +53,7 @@ def run_model(inputs, args):
 
     # WOP
     # Scale inversely proportional to times (T)
-    pWeight = inputs["representative_period_weight"] / SCALE_TIMES
+    pWeight = inputs["representative_period_weight"] / (samples / original_len_T)
 
     pRamping = inputs["ramping_value"]
 
@@ -82,6 +86,17 @@ def run_model(inputs, args):
         value="ImpCap_MW"
     )
 
+    # We need to sort the dictionaries for changing to tensors!
+    pDemand = dict(sorted(pDemand.items()))
+    pGenAva = dict(sorted(pGenAva.items()))
+    pInvCost = dict(sorted(pInvCost.items()))
+    pVarCost = dict(sorted(pVarCost.items()))
+    pUnitCap = dict(sorted(pUnitCap.items()))
+    pExpCap = dict(sorted(pExpCap.items()))
+    pImpCap = dict(sorted(pImpCap.items()))
+
+
+    print("Creating problem instance")
     data = GEPProblem(T, G, L, N, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
 
     save_dir = os.path.join('outputs', 'PDL',
@@ -92,21 +107,26 @@ def run_model(inputs, args):
         pickle.dump(args, f)
 
     # Run PDL
+    print("Training the PDL")
     primal_net, dual_net, stats = train_PDL(data, args, save_dir)
 
 if __name__ == "__main__":
-    args = {"K": 10,
+    args = {
+            # "K": 10,
+            "K": 10,
             "L": 500,
+            # "L": 10,
             "tau": 0.8,
             "rho": 0.5,
             "rho_max": 5000,
             "alpha": 10,
-            "batch_size": 200,
+            "batch_size": 1,
             "hidden_size": 500,
             "primal_lr": 1e-4,
             "dual_lr": 1e-4,
             "decay": 0.99,
-            "patience": 10}
+            "patience": 10,
+            "corrEps": 1e-4}
 
     # Train the model:
     for i, experiment_instance in enumerate(experiment["experiments"]):

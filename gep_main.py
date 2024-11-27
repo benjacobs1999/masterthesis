@@ -48,6 +48,12 @@ def run_model(inputs):
     L = inputs["transmission_lines"] # [('Country1', 'Country2'), ...] ---> 44
     N = inputs["nodes"] # ['Country1', 'Country2', ...] ---> 20
 
+    original_len_T = len(T)
+    samples = 10
+    # 10 samples
+    T = range(1, 1+samples)
+    print(T)
+
     # Extract time series data
     pDemand = dataframe_to_dict(
         inputs["demand_data"],
@@ -62,7 +68,7 @@ def run_model(inputs):
 
     # Extract scalar parameters
     pVOLL = inputs["value_of_lost_load"]
-    pWeight = inputs["representative_period_weight"]
+    pWeight = inputs["representative_period_weight"] / (samples / original_len_T)
     pRamping = inputs["ramping_value"]
 
     # Extract generator parameters
