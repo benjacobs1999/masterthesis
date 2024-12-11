@@ -14,6 +14,7 @@ from torch.utils.data import TensorDataset, DataLoader
 
 import default_args
 from utils import my_hash
+from torch.utils.tensorboard import SummaryWriter
 
 torch.set_default_dtype(torch.float32)
 
@@ -54,7 +55,8 @@ def train_PDL(data, args, save_dir):
     test_loader = DataLoader(test_dataset, batch_size=len(test_dataset))
 
     primal_net = PrimalNet(data, hidden_size).to(dtype=torch.float32, device=DEVICE)
-    dual_net = DualNetTwoOutputLayers(data, hidden_size).to(dtype=torch.float32, device=DEVICE)
+    # dual_net = DualNetTwoOutputLayers(data, hidden_size).to(dtype=torch.float32, device=DEVICE)
+    dual_net = DualNet(data, hidden_size).to(dtype=torch.float32, device=DEVICE)
 
     primal_lr = 1e-4
     dual_lr = 1e-4
@@ -71,6 +73,10 @@ def train_PDL(data, args, save_dir):
     dual_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         dual_optim, mode='min', factor=decay, patience=patience
     )
+
+    # Initialize TensorBoard writer
+    writer = SummaryWriter(log_dir=f"reproduction-experiments/tensorboard_logs/{str(time.time())}")
+
     for k in range(K):
         begin_time = time.time()
         epoch_stats = {}
@@ -85,7 +91,8 @@ def train_PDL(data, args, save_dir):
                 primal_optim.zero_grad()
                 y = primal_net(Xtrain)
                 mu, lamb = frozen_dual_net(Xtrain)
-                train_loss = primal_loss(data, Xtrain, y, mu, lamb, rho)
+                # train_loss = primal_loss(data, Xtrain, y, mu, lamb, rho)
+                train_loss = primal_loss(data, Xtrain, y, mu, lamb, rho, writer=writer, writer_title="Inner_Iterations", writer_steps=2*k*L + l1)
                 train_loss.mean().backward()
                 primal_optim.step()
                 train_time = time.time() - start_time
@@ -102,6 +109,17 @@ def train_PDL(data, args, save_dir):
             curr_val_loss /= len(valid_loader)
             # Normalize by rho, so that the schedular still works correctly if rho is increased
             primal_scheduler.step(torch.sign(curr_val_loss) * (torch.abs(curr_val_loss) / rho))
+
+            # Log weights and gradients
+            for i, param in enumerate(primal_net.parameters()):
+                # Log weights
+                weight_norm = param.data.norm(2).item()
+                writer.add_scalar(f"Weights/primal/layer_{i}", weight_norm, k*L + l1)
+                
+                # Log gradients
+                if param.grad is not None:
+                    grad_norm = param.grad.norm(2).item()
+                    writer.add_scalar(f"Gradients/primal/layer_{i}", grad_norm, k*L + l1)
         
         dict_agg(epoch_stats, 'train_loss_primal', train_loss.detach().cpu().numpy())
 
@@ -112,7 +130,7 @@ def train_PDL(data, args, save_dir):
         # Calculate v_k
         y = frozen_primal_net(data.trainX.to(DEVICE))
         mu_k, lamb_k = frozen_dual_net(data.trainX.to(DEVICE))
-        v_k = violation(data, data.trainX.to(DEVICE), y, lamb_k, rho)
+        v_k = violation(data, data.trainX.to(DEVICE), y, mu_k, rho)
 
         for l2 in range(L):
             # Update dual net using dual loss
@@ -123,7 +141,8 @@ def train_PDL(data, args, save_dir):
                 mu, lamb = dual_net(Xtrain)
                 mu_k, lamb_k = frozen_dual_net(Xtrain)
                 y = frozen_primal_net(Xtrain)
-                train_loss = dual_loss(data, Xtrain, y, mu, lamb, mu_k, lamb_k, rho)
+                # train_loss = dual_loss(data, Xtrain, y, mu, lamb, mu_k, lamb_k, rho)
+                train_loss = dual_loss(data, Xtrain, y, mu, lamb, mu_k, lamb_k, rho, writer=writer, writer_title="Inner_Iterations", writer_steps=2*k*L + l1 + l2)
                 # train_loss.sum().backward()
                 train_loss.mean().backward()
                 dual_optim.step()
@@ -142,6 +161,17 @@ def train_PDL(data, args, save_dir):
             # Normalize by rho, so that the schedular still works correctly if rho is increased
             dual_scheduler.step(torch.sign(curr_val_loss) * (torch.abs(curr_val_loss) / rho))
 
+            # Log weights and gradients
+            for i, param in enumerate(dual_net.parameters()):
+                # Log weights
+                weight_norm = param.data.norm(2).item()
+                writer.add_scalar(f"Weights/dual_net/layer_{i}", weight_norm, k*L + l2)
+                
+                # Log gradients
+                if param.grad is not None:
+                    grad_norm = param.grad.norm(2).item()
+                    writer.add_scalar(f"Gradients/dual_net/layer_{i}", grad_norm, k*L + l2)
+
         dict_agg(epoch_stats, 'train_loss_dual', train_loss.detach().cpu().numpy())
 
         ##### Evaluate #####
@@ -156,6 +186,12 @@ def train_PDL(data, args, save_dir):
         # for Xtest in test_loader:
         #     Xtest = Xtest[0].to(DEVICE)
         #     eval_pdl(data, Xtest, primal_net, args, 'test', epoch_stats)
+
+        # Log additional metrics
+        writer.add_scalar("Metrics/Violation", v_k, k)
+        writer.add_scalar("Metrics/Rho", rho, k)
+        writer.add_scalar("Metrics/Primal_LR", primal_optim.param_groups[0]['lr'], k)
+        writer.add_scalar("Metrics/Dual_LR", dual_optim.param_groups[0]['lr'], k)
 
         end_time = time.time()
         stats = epoch_stats
@@ -185,12 +221,16 @@ def train_PDL(data, args, save_dir):
 
     return primal_net, dual_net, stats
 
-def primal_loss(data, X, y, mu, lamb, rho):
+def primal_loss(data, X, y, mu, lamb, rho, writer=None, writer_title=None, writer_steps=None):
     obj = data.obj_fn(y)
     # g(y)
     ineq = data.ineq_resid(X, y)
     # h(y)
     eq = data.eq_resid(X, y)
+
+    # ! Clamp mu!
+    # Element-wise clamping of mu_i when g_i (ineq) is negative
+    mu = torch.where(ineq < 0, torch.zeros_like(mu), mu)
 
     lagrange_ineq = torch.sum(mu * ineq, dim=1)  # Shape (batch_size,)
     lagrange_eq = torch.sum(lamb * eq, dim=1)   # Shape (batch_size,)
@@ -199,9 +239,21 @@ def primal_loss(data, X, y, mu, lamb, rho):
     violation_eq = torch.sum(eq ** 2, dim=1)
     penalty = rho/2 * (violation_ineq + violation_eq)
 
-    return obj + lagrange_ineq + lagrange_eq + penalty
+    loss = obj + lagrange_ineq + lagrange_eq + penalty
 
-def dual_loss(data, X, y, mu, lamb, mu_k, lamb_k, rho):
+    if writer is not None and writer_title is not None and writer_steps is not None:
+        writer.add_scalar(f"Primal_Loss/{writer_title}", loss.detach().mean().item(), writer_steps)
+        writer.add_scalar(f"Constraints/{writer_title}/mu", mu.detach().mean().item(), writer_steps)
+        writer.add_scalar(f"Constraints/{writer_title}/lamb", lamb.detach().mean().item(), writer_steps)
+        writer.add_scalar(f"Constraints/{writer_title}/g", ineq.detach().mean().item(), writer_steps)
+        writer.add_scalar(f"Constraints/{writer_title}/h", eq.detach().mean().item(), writer_steps)
+        writer.add_scalar(f"Constraints/{writer_title}/mu*g", lagrange_ineq.detach().mean().item(), writer_steps)
+        writer.add_scalar(f"Constraints/{writer_title}/lamb*h", lagrange_eq.detach().mean().item(), writer_steps)
+        writer.add_scalar(f"Obj_Function/{writer_title}", data.obj_fn(y.detach()).mean().item(), writer_steps)
+
+    return loss
+
+def dual_loss(data, X, y, mu, lamb, mu_k, lamb_k, rho, writer=None, writer_title=None, writer_steps=None):
     # g(y)
     ineq = data.ineq_resid(X, y)
     # h(y)
@@ -213,11 +265,23 @@ def dual_loss(data, X, y, mu, lamb, mu_k, lamb_k, rho):
     # Compute the dual residuals for equality constraints
     dual_resid_eq = lamb - (lamb_k + rho * eq)
     dual_resid_eq = torch.norm(dual_resid_eq, dim=1)  # Norm along constraint dimension
-    
-    # Total dual loss as the sum of both residuals
-    return dual_resid_ineq + dual_resid_eq
 
-def violation(data, X, y, lamb_k, rho):
+    loss = dual_resid_ineq + dual_resid_eq
+
+    if writer is not None and writer_title is not None and writer_steps is not None:
+        writer.add_scalar(f"Dual_Loss/{writer_title}", loss.detach().mean().item(), writer_steps)
+        writer.add_scalar(f"Constraints/{writer_title}/mu", mu.detach().mean().item(), writer_steps)
+        writer.add_scalar(f"Constraints/{writer_title}/lamb", lamb.detach().mean().item(), writer_steps)
+        writer.add_scalar(f"Constraints/{writer_title}/g", ineq.detach().mean().item(), writer_steps)
+        writer.add_scalar(f"Constraints/{writer_title}/h", eq.detach().mean().item(), writer_steps)
+        writer.add_scalar(f"Constraints/{writer_title}/ineq_resid", dual_resid_ineq.detach().mean().item(), writer_steps)
+        writer.add_scalar(f"Constraints/{writer_title}/eq_resid", dual_resid_eq.detach().mean().item(), writer_steps)
+        writer.add_scalar(f"Obj_Function/{writer_title}", data.obj_fn(y.detach()).mean().item(), writer_steps)
+
+    return loss
+
+
+def violation(data, X, y, mu_k, rho):
     # Calculate the equality constraint function h_x(y)
     eq = data.eq_resid(X, y)  # Assume shape (num_samples, n_eq)
     
@@ -228,7 +292,7 @@ def violation(data, X, y, lamb_k, rho):
     ineq = data.ineq_resid(X, y)  # Assume shape (num_samples, n_ineq)
     
     # Calculate sigma_x(y) for each inequality constraint
-    sigma_y = torch.maximum(ineq, -lamb_k / rho)  # Element-wise max
+    sigma_y = torch.maximum(ineq, -mu_k / rho)  # Element-wise max
     
     # Calculate the infinity norm of sigma_x(y)
     sigma_y_inf_norm = torch.abs(sigma_y).max(dim=1).values  # Shape: (num_samples,)
@@ -411,10 +475,10 @@ def main():
     prob_type = args['probType']
     if prob_type == 'simple':
         torch.set_default_dtype(torch.float64)
-        filepath = os.path.join('datasets', 'simple', "random_simple_dataset_var{}_ineq{}_eq{}_ex{}".format(
+        filepath = os.path.join('reproduction-experiments', 'datasets', 'simple', "random_simple_dataset_var{}_ineq{}_eq{}_ex{}".format(
             args['simpleVar'], args['simpleIneq'], args['simpleEq'], args['simpleEx']))
     elif prob_type == 'nonconvex':
-        filepath = os.path.join('datasets', 'nonconvex', "random_nonconvex_dataset_var{}_ineq{}_eq{}_ex{}".format(
+        filepath = os.path.join('reproduction-experiments', 'datasets', 'nonconvex', "random_nonconvex_dataset_var{}_ineq{}_eq{}_ex{}".format(
             args['nonconvexVar'], args['nonconvexIneq'], args['nonconvexEq'], args['nonconvexEx']))
     else:
         raise NotImplementedError

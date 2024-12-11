@@ -1,12 +1,20 @@
+import time
+import numpy as np
 from gep_config_parser import *
 from data_wrangling import dataframe_to_dict
 import pyomo.environ as pyo
+import torch
+
+DEVICE = 'cpu'
 
 CONFIG_FILE_NAME        = "config.toml"
 VISUALIZATION_FILE_NAME = "visualization.toml"
 
 HIGHS  = "HiGHS"
 GUROBI = "Gurobi"
+
+# SAMPLE_DURATION = 12 # 12 hours
+SAMPLE_DURATION = 12 # 12 hours
 
 ## Step 0: Activate environment - ensure consistency accross computers
 # print("Reading the data")
@@ -32,73 +40,88 @@ elif optimizer_name == GUROBI:
 else:
     raise ValueError(f"{optimizer_name}: Not implemented")
 
-def run_model(inputs):
+def prep_data(inputs):
+        print("Wrangling the input data")
+
+        # Extract sets
+        T = inputs["times"] # [1, 2, 3, ... 8761] ---> 8761
+        G = inputs["generators"] # [('Country1', 'EnergySource1'), ...] ---> 107
+        L = inputs["transmission_lines"] # [('Country1', 'Country2'), ...] ---> 44
+        N = inputs["nodes"] # ['Country1', 'Country2', ...] ---> 20
+
+        ### SET UP CUSTOM CONFIG ###
+        # N = ['BEL', 'FRA', 'GER', 'NED'] # 4 nodes
+        # N = ['BEL', 'GER', 'NED'] # 3 nodes
+        # G = [('BEL', 'SunPV'), ('FRA', 'SunPV'), ('GER', 'SunPV'), ('NED', 'SunPV')] # 4 generators
+        # G = [('BEL', 'SunPV'), ('GER', 'SunPV'), ('NED', 'SunPV')] # 3 generators
+        # L = [('BEL', 'FRA'), ('BEL', 'GER'), ('BEL', 'NED'), ('GER', 'FRA'), ('GER', 'NED')] # 5 lines
+        # L = [('BEL', 'GER'), ('BEL', 'NED'), ('GER', 'NED')] # 3 lines
+
+
+        # Extract time series data
+        pDemand = dataframe_to_dict(
+            inputs["demand_data"],
+            keys=["Country", "Time"],
+            value="Demand_MW"
+        )
+        pGenAva = dataframe_to_dict(
+            inputs["generation_availability_data"],
+            keys=["Country", "Technology", "Time"],
+            value="Availability_pu"
+        )
+
+        # Extract scalar parameters
+        pVOLL = inputs["value_of_lost_load"]
+        pWeight = inputs["representative_period_weight"] / (SAMPLE_DURATION / len(T))
+        pRamping = inputs["ramping_value"]
+
+        # Extract generator parameters
+        pInvCost = dataframe_to_dict(
+            inputs["generation_data"],
+            keys=["Country", "Technology"],
+            value="InvCost_kEUR_MW_year"
+        )
+        pVarCost = dataframe_to_dict(
+            inputs["generation_data"],
+            keys=["Country", "Technology"],
+            value="VarCost_kEUR_per_MWh"
+        )
+        pUnitCap = dataframe_to_dict(
+            inputs["generation_data"],
+            keys=["Country", "Technology"],
+            value="UnitCap_MW"
+        )
+
+        # Extract line parameters
+        pExpCap = dataframe_to_dict(
+            inputs["transmission_lines_data"],
+            keys=["CountryA", "CountryB"],
+            value="ExpCap_MW"
+        )
+        pImpCap = dataframe_to_dict(
+            inputs["transmission_lines_data"],
+            keys=["CountryA", "CountryB"],
+            value="ImpCap_MW"
+        )
+
+        # We need to sort the dictionaries for changing to tensors!
+        pDemand = dict(sorted(pDemand.items()))
+        pGenAva = dict(sorted(pGenAva.items()))
+        pInvCost = dict(sorted(pInvCost.items()))
+        pVarCost = dict(sorted(pVarCost.items()))
+        pUnitCap = dict(sorted(pUnitCap.items()))
+        pExpCap = dict(sorted(pExpCap.items()))
+        pImpCap = dict(sorted(pImpCap.items()))
+
+        return T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap
+
+def run_model(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap):
     
     if outputs_config["terminal"]["input_plots"]:
         # print("Input data statistics")
         # visualization_data = get_visualization_data(VISUALIZATION_FILE_NAME)
         # print_input_statistics(inputs, visualization_data)
         pass
-
-    print("Wrangling the input data")
-
-    # Extract sets
-    T = inputs["times"] # [1, 2, 3, ... 8761] ---> 8761
-    G = inputs["generators"] # [('Country1', 'EnergySource1'), ...] ---> 107
-    L = inputs["transmission_lines"] # [('Country1', 'Country2'), ...] ---> 44
-    N = inputs["nodes"] # ['Country1', 'Country2', ...] ---> 20
-
-    original_len_T = len(T)
-    samples = 10
-    # 10 samples
-    T = range(1, 1+samples)
-    print(T)
-
-    # Extract time series data
-    pDemand = dataframe_to_dict(
-        inputs["demand_data"],
-        keys=["Country", "Time"],
-        value="Demand_MW"
-    )
-    pGenAva = dataframe_to_dict(
-        inputs["generation_availability_data"],
-        keys=["Country", "Technology", "Time"],
-        value="Availability_pu"
-    )
-
-    # Extract scalar parameters
-    pVOLL = inputs["value_of_lost_load"]
-    pWeight = inputs["representative_period_weight"] / (samples / original_len_T)
-    pRamping = inputs["ramping_value"]
-
-    # Extract generator parameters
-    pInvCost = dataframe_to_dict(
-        inputs["generation_data"],
-        keys=["Country", "Technology"],
-        value="InvCost_kEUR_MW_year"
-    )
-    pVarCost = dataframe_to_dict(
-        inputs["generation_data"],
-        keys=["Country", "Technology"],
-        value="VarCost_kEUR_per_MWh"
-    )
-    pUnitCap = dataframe_to_dict(
-        inputs["generation_data"],
-        keys=["Country", "Technology"],
-        value="UnitCap_MW"
-    )
-
-    # Extract line parameters
-    pExpCap = dataframe_to_dict(
-        inputs["transmission_lines_data"],
-        keys=["CountryA", "CountryB"],
-        value="ExpCap_MW"
-    )
-    pImpCap = dataframe_to_dict(
-        inputs["transmission_lines_data"],
-        keys=["CountryA", "CountryB"],
-        value="ImpCap_MW"
-    )
     
     # Extract optimizer attributes
     attributes = data["optimizer_config"][optimizer_name]
@@ -222,19 +245,47 @@ def run_model(inputs):
 
         ## Step 4: Solve
         print("Solving the optimization problem")
-        results = solver.solve(model, tee=True)
+        # results = solver.solve(model, tee=True)
+        results = solver.solve(model, tee=False)
+        time_taken = solver._solver_model.Runtime
 
         print(f"Objective Value: {model.obj()}")
+        return model, solver, time_taken
 
+def get_variable_values_as_list(var):
+    # Check if the variable is indexed
+    if var.is_indexed():
+        return [var[idx].value for idx in var]
+    else:
+        # For scalar variables
+        return [var.value]
     
 if __name__ == "__main__":
     for i, experiment_instance in enumerate(experiment["experiments"]):
         # Setup output dataframe
         df_res = pd.DataFrame(columns=["setup_time", "presolve_time", "barrier_time", "crossover_time", "restore_time", "objective_value"])
 
-        for j in range(experiment["repeats"]):
+        T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap = prep_data(experiment_instance)
+
+        T_ranges = [range(i, i + SAMPLE_DURATION, 1) for i in range(1, len(T), SAMPLE_DURATION)]
+        objective_values = []
+        times = []
+        train_size = 584
+        val_size = 73
+        # for t in T_ranges[train_size:train_size+val_size]:
+        for t in T_ranges[:1]:
             # Run one experiment for j repeats
-            res, setup_time, restore_time = run_model(experiment_instance)
+            model, solver, time_taken = run_model(experiment_instance, t, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
+            
+            
+            # print("Print values for all variables")
+            # for v in model.component_data_objects(pyo.Var):
+            #     print(str(v), v.value)
+            print(model.obj())
+            objective_values.append(model.obj())
+            times.append(time_taken)
+            print(time)
+
 
             # # Check symmetry and append results
             # if experiment_instance["symmetry"] == "s2":
@@ -261,9 +312,19 @@ if __name__ == "__main__":
             #             "objective_value": [objective_value(res)]
             #         })
             #     ], ignore_index=True)
+            # model.display()
 
         # Write DataFrame to CSV
-        df_res.to_csv(experiment_instance["output_file"], index=False)
-    
+        # df_res.to_csv(experiment_instance["output_file"], index=False)
+
+
+        # Write the number to the file
+        # file_path = os.path.join("outputs/Gurobi", f"VAL_SET_samplesize_{str(SAMPLE_DURATION)}_node_{len(N)}_gen_{len(G)}_lines_{len(L)}.txt")
+        # with open(file_path, "w") as file:
+        #     file.write(f"N: {str(N)}\n")
+        #     file.write(f"G: {str(G)}\n")
+        #     file.write(f"L: {str(L)}\n")
+        #     file.write(f"Obj value mean: {str(np.mean(objective_values))}\n")
+        #     file.write(f"Time taken mean: {str(np.mean(times))}\n")
 
     
