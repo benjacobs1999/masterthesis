@@ -2,9 +2,9 @@
     "N": ["BEL", "GER"],
     "G": [["BEL", "SunPV"], ["GER", "SunPV"]],
     "L": [["BEL", "GER"]],
-    "operational": true,
+    "operational": false,
     "sample_duration": 24,
-    "scale_problem": true,
+    "scale_problem": false,
 
     "outer_iterations": 10,
     "inner_iterations": 1000,

@@ -5,7 +5,7 @@ from gep_config_parser import *
 from data_wrangling import dataframe_to_dict
 
 from primal_dual import PrimalDualTrainer
-from gep_problem import GEPProblemSet
+from gep_problem_refactored import GEPProblemSet
 from gep_problem_operational import GEPOperationalProblemSet
 
 CONFIG_FILE_NAME        = "config.toml"
@@ -27,14 +27,6 @@ SCALE_FACTORS = {
 
 def scale_dict(data_dict, scale_factor):
     return {key: value * scale_factor for key, value in data_dict.items()}
-
-
-## Step 1: parse the input data
-print("Parsing the config file")
-
-data = parse_config(CONFIG_FILE_NAME)
-experiment = data["experiment"]
-outputs_config = data["outputs_config"]
 
 
 def prep_data(inputs, N=None, G=None, L=None, train=0.8, valid=0.1, test=0.1, scale=True, sample_duration=12, constant_gen_inv=False):
@@ -147,6 +139,13 @@ def run_PDL(data, args, save_dir):
 if __name__ == "__main__":
     import json
 
+    ## Step 1: parse the input data
+    print("Parsing the config file")
+
+    data = parse_config(CONFIG_FILE_NAME)
+    experiment = data["experiment"]
+    outputs_config = data["outputs_config"]
+
     with open("config.json", "r") as file:
         args = json.load(file)
     
@@ -169,8 +168,6 @@ if __name__ == "__main__":
             
             # Prep proble data:
             data = prep_data(experiment_instance, N=args["N"], G=args["G"], L=args["L"], train=args["train"], valid=args["valid"], test=args["test"], scale=args["scale_problem"], sample_duration=args["sample_duration"], constant_gen_inv=args["operational"])
-
-            data.obj_fn(data._opt_targets["y"][:1])
 
             # Run PDL
             run_PDL(data, args, save_dir)

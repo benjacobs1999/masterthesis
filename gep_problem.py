@@ -1,13 +1,12 @@
 import numpy as np
 import torch
 import pickle
-from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
 
 
 class GEPProblemSet():
 
     def __init__(self, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, sample_duration=12, train=0.8, valid=0.1, test=0.1):
-        # ! Assume y = [p_{g,t}, f_{l,t}, md_{n,t}, ui_g]
         self.DTYPE = torch.float64
         self.DEVICE = torch.device="cpu"
         torch.set_default_dtype(self.DTYPE)
@@ -17,6 +16,11 @@ class GEPProblemSet():
         self.G = G
         self.L = L
         self.N = N
+
+        self.num_g = len(G)
+        self.num_l = len(L)
+        self.num_n = len(N)
+
         # Input Parameters (Dictionaries)
         self.pDemand = pDemand
         self.pGenAva = pGenAva
@@ -28,6 +32,13 @@ class GEPProblemSet():
         self.pUnitCap = pUnitCap
         self.pExpCap = pExpCap
         self.pImpCap = pImpCap
+        
+        # Number of variables per timestep -- per timestep, variables are [p_g, f_l, md_n]
+        self.n_var_per_t = self.num_g + self.num_l + self.num_n
+        # Number of inequality constraints per timestep -- lower and upper bounds (2*) for p_g, f_l, md_n
+        self.n_ineq_per_t = 2 * (self.num_g + self.num_l + self.num_n)
+        # Number of equality constraints per timestep
+        self.n_eq_per_t = self.num_n
 
         # Number of timesteps per data sample
         assert (float(len(T)) / sample_duration).is_integer() # Total number of timesteps should be divisible by the number of timesteps per data sample.
@@ -36,44 +47,41 @@ class GEPProblemSet():
         # Time slices, each slice makes a different sample.
         self.time_ranges = [range(i, i + sample_duration, 1) for i in range(1, len(T), sample_duration)]
 
-        self.index_f_offset = len(self.G) * self.sample_duration
-        self.index_md_offset = len(self.G) * self.sample_duration + len(self.L) * self.sample_duration
-        self.index_ui_offset = len(self.G) * self.sample_duration + len(self.L) * self.sample_duration + len(self.N) * self.sample_duration
+        self.neq = self.n_eq_per_t * sample_duration
+        self.nineq = self.n_ineq_per_t * sample_duration
+        self.n_inv_vars = self.num_g
+        self.n_prod_vars = self.num_g * sample_duration
+        self.n_line_vars = self.num_l * sample_duration
+        self.n_md_vars = self.num_n * sample_duration
+        self.ydim = self.n_inv_vars, self.n_prod_vars + self.n_line_vars + self.n_md_vars
 
         # Known optimal values from Gurobi.
-        # file_path = f"outputs/Gurobi/OPERATIONAL={False}_GEP_OPT_TARGETS_T={self.sample_duration}"
-        #! All generators:
-        # file_path = "outputs/Gurobi/ALL_GENERATORS-OPERATIONAL=False-GEP_OPT_TARGETS_T=12"
-        #! Sun and gas generators:
-        # file_path = "outputs/Gurobi/SUN_AND_GAS-OPERATIONAL=False-GEP_OPT_TARGETS_T=12"
-        #! Only BEL, GER and Gas generators
-        file_path = "outputs/Gurobi/BEL_GER_GAS-OPERATIONAL=False-GEP_OPT_TARGETS_T=12"
+        # file_path = f"outputs/Gurobi/OPERATIONAL={True}_GEP_OPT_TARGETS_T={self.sample_duration}"
+        # ! BEL, GER, only Gas generators
+        # file_path = f"outputs/Gurobi/BEL_GER_GAS-OPERATIONAL=True-GEP_OPT_TARGETS_T=12"
+        # ! BEL, GER, only Sun generators
+        file_path = "outputs/Gurobi/BEL_GER_SUN-OPERATIONAL=True-GEP_OPT_TARGETS_T=24"
         with open(file_path, 'rb') as file:
             self._opt_targets = pickle.load(file)
 
-        self._generator_node_map = {g: connected_node for connected_node, g in self.G}
-        self._line_start_node_map = {start_node: end_node for start_node, end_node in self.L}
-        self._line_end_node_map = {end_node: start_node for start_node, end_node in self.L}
-
         # Masks for node balance!
         # Initialize mask
-        self.gen_to_node_mask = np.zeros((len(N), len(G)), dtype=int)
+        self.node_to_gen_mask = torch.zeros((len(N), len(G)), dtype=torch.float64)
 
         # Populate mask
         for g_idx, (node, _) in enumerate(G):
             node_idx = N.index(node)
-            self.gen_to_node_mask[node_idx, g_idx] = 1
+            self.node_to_gen_mask[node_idx, g_idx] = 1
         
-        # Initialize masks
-        self.incoming_mask = np.zeros((len(N), len(L)), dtype=int)
-        self.outgoing_mask = np.zeros((len(N), len(L)), dtype=int)
+        # Initialize mask
+        self.lineflow_mask = torch.zeros((len(N), len(L)), dtype=torch.float64)
 
-        # Populate masks
+        # Populate mask (directed adjacency matrix), -1 where line starts, 1 where line stops
         for l_idx, (start_node, end_node) in enumerate(L):
             start_idx = N.index(start_node)
             end_idx = N.index(end_node)
-            self.outgoing_mask[start_idx, l_idx] = 1
-            self.incoming_mask[end_idx, l_idx] = 1
+            self.lineflow_mask[start_idx, l_idx] = -1
+            self.lineflow_mask[end_idx, l_idx] = 1
         
         # Create constraint matrices, rhs and obj_fns
         print("Populating ineq constraints")
@@ -83,50 +91,12 @@ class GEPProblemSet():
         print("Creating objective coefficients")
         self.obj_coeff = self.build_obj_coeff()
         print("Creating input for NN: X")
-        self.X = self.build_X()
-
-        self.X_scaled = self.scale_X(self.X)
-        # self.y_coeff = self.scale_Y_coeff()
-
-        self.neq = self.eq_cm.shape[1]
-        self.nineq = self.ineq_cm.shape[1]
-        self.ydim = len(self.obj_coeff)
+        # self.X = self.build_X()
+        self.X = torch.concat([self.eq_rhs, self.ineq_rhs], dim=1)
         self.xdim = self.X.shape[1]
-
-        # Variable indices, to extract variables from Y
-        self.p_gt_indices = range(0, self.index_f_offset)
-        self.f_lt_indices = range(self.index_f_offset, self.index_md_offset)
-        self.md_nt_indices = range(self.index_md_offset, self.index_ui_offset)
-        self.ui_g_indices = range(self.index_ui_offset, self.ydim)
-
-        # Constraint indices, to extract specific constraint residuals
-        # eq constraints: only eq 3.1c
-        self.constraint_c_indices = range(self.neq)
-
-        # ineq constraints: b,d,e,f,g,h,i,j,k
-        self.constraint_b_offset = 0
-        self.constraint_d_offset = self.constraint_b_offset + len(self.G)*self.sample_duration 
-        self.constraint_e_offset = self.constraint_d_offset + len(self.L)*self.sample_duration 
-        self.constraint_f_offset = self.constraint_e_offset + len(self.L)*self.sample_duration 
-        self.constraint_g_offset = self.constraint_f_offset + len(G)*(self.sample_duration - 1)
-        self.constraint_h_offset = self.constraint_g_offset + len(G)*(self.sample_duration - 1)
-        self.constraint_i_offset = self.constraint_h_offset + len(G)*self.sample_duration 
-        self.constraint_j_offset = self.constraint_i_offset + len(N)*self.sample_duration 
-        self.constraint_k_offset = self.constraint_j_offset + len(N)*self.sample_duration 
-
-        self.constraint_b_indices = range(self.constraint_b_offset, self.constraint_d_offset)
-        self.constraint_d_indices = range(self.constraint_d_offset, self.constraint_e_offset)
-        self.constraint_e_indices = range(self.constraint_e_offset, self.constraint_f_offset)
-        self.constraint_f_indices = range(self.constraint_f_offset, self.constraint_g_offset)
-        self.constraint_g_indices = range(self.constraint_g_offset, self.constraint_h_offset)
-        self.constraint_h_indices = range(self.constraint_h_offset, self.constraint_i_offset)
-        self.constraint_i_indices = range(self.constraint_i_offset, self.constraint_j_offset)
-        self.constraint_j_indices = range(self.constraint_j_offset, self.constraint_k_offset)
-        self.constraint_k_indices = range(self.constraint_k_offset, self.nineq)
 
         # Split x into training, val, test sets.
         self._split_X_in_sets(train, valid, test)
-        
     
     # Split the data
     @property
@@ -139,24 +109,96 @@ class GEPProblemSet():
     @property
     def opt_targets(self): return self._opt_targets
     
-    def set_train_extractor(self, train_extractor):
-        self.train_extractor = train_extractor
+    def split_ineq_constraints(self, ineq):
+        # TODO: Fix for inclusion of 3.1k.
+        """Groups the inequality [residuals or RHS] into constraints by constraint type.
+            Assume ineq = [3.1k, [3.1h, 3.1b, 3.1d, 3.1e, 3.1i, 3,1j] * T] (per sample in batch)
+
+            returns each constraint type in the form [Batchsize, nr_of_constraints, time]
+
+            Returns h, b, d, e, i, j
+        """
+        batch_size = ineq.shape[0]  # Get batch size
+
+        # Reshape ineq to [batch_size, sample_duration, n_ineq_per_t]
+        # This keeps constraints grouped per time step
+        ineq = ineq.view(batch_size, self.sample_duration, self.n_ineq_per_t).permute(0, 2, 1)
+
+        # Define segment sizes based on multiple constraints per type
+        sizes = [self.num_g, self.num_g, self.num_l, self.num_l, self.num_n, self.num_n]  # Num constraints per type
+
+        # Extract constraint tensors along the first dimension (constraint type)
+        h, b, d, e, i, j = torch.split(ineq, sizes, dim=1)
+
+        return h, b, d, e, i, j
     
-    def set_valid_extractor(self, valid_extractor):
-        self.valid_extractor = valid_extractor
+    def split_eq_constraints(self, eq):
+        """Groups the inequality [residuals or RHS] into constraints by constraint type.
+            Assume ineq = [3.1c] * T (per sample in batch)
+
+            returns each constraint type in the form [Batchsize, nr_of_constraints, time]
+
+            Returns c
+        """
+        batch_size = eq.shape[0]
+        c = eq.view(batch_size, self.sample_duration, self.n_eq_per_t).permute(0, 2, 1)
+        return c
+
+    def split_dec_vars_from_Y_raw(self, Y):
+        # TODO: Fix for inclusion of 3.1k.
+        """Groups the decision variables from the NN output BEFORE REPAIRS by type.
+            Assume y =  [p_{g,t0}, f_{l,t0}, 
+                         p_{g,t1}, f_{l,t1}, ..., 
+                         p_{g,tn}, f_{l,tn}] (per sample in batch)
+
+            Returns p_{g,t}, f_{l,t}
+        """
+        batch_size = Y.shape[0]  # Get batch size
+
+        # Reshape Y for efficient slicing
+        Y = Y.view(batch_size, self.sample_duration, self.n_var_per_t - self.num_n).permute(0, 2, 1)
+
+        # Define segment sizes
+        sizes = [self.num_g, self.num_l]
+
+        # Extract constraint tensors
+        p_gt, f_lt = torch.split(Y, sizes, dim=1)
+
+        return p_gt, f_lt
+
+    def split_dec_vars_from_Y(self, Y):
+        # TODO: Fix for inclusion of 3.1k.
+        """Groups the decision variables from the NN output AFTER REPAIRS by type.
+            Assume y =  [p_{g,t0}, f_{l,t0}, md_{n,t0}, 
+                         p_{g,t1}, f_{l,t1}, md_{n,t1}, ..., 
+                         p_{g,tn}, f_{l,tn}, md_{n,tn}]
+
+            Returns p_{g,t}, f_{l,t}, md_{n,t}
+        """
+        batch_size = Y.shape[0]  # Get batch size
+
+        # Reshape Y to [batch_size, sample_duration, -1] for efficient slicing
+        Y = Y.view(batch_size, self.sample_duration, self.n_var_per_t).permute(0, 2, 1)
+
+        # Define segment sizes
+        sizes = [self.num_g, self.num_l, self.num_n]
+
+        # Extract constraint tensors
+        p_gt, f_lt, md_nt = torch.split(Y, sizes, dim=1)
+
+        return p_gt, f_lt, md_nt
 
     def ineq_resid(self, Y, ineq_cm, ineq_rhs):
-        # Y *= self.y_coeff
         return torch.bmm(ineq_cm, Y.unsqueeze(-1)).squeeze(-1) - ineq_rhs
 
     def eq_resid(self, Y, eq_cm, eq_rhs):
-        # Y *= self.y_coeff
+        torch.bmm(eq_cm, Y.unsqueeze(-1)).squeeze(-1)
         return torch.bmm(eq_cm, Y.unsqueeze(-1)).squeeze(-1) - eq_rhs
 
     def obj_fn(self, Y):
         # obj_coeff does not need batching, objective is the same over different samples.
-        # Y *= self.y_coeff
-        return self.obj_coeff @ Y.T
+
+        return self.pWeight * self.obj_coeff @ Y.T
     
     def dual_obj_fn(self, eq_rhs, ineq_rhs, mu, lamb):
         # Batched dot product
@@ -172,23 +214,32 @@ class GEPProblemSet():
         return torch.clamp(resids, 0)
     
     def build_obj_coeff(self,):
-        # ! Assume y = [p_{g,t}, f_{l,t}, md_{n,t}, ui_g]
-        c = self._create_empty_row()
+        """ Builds the objective function coefficients (only the operating costs)
+            Assume y =  [ui_g0, ui_g1, ..., ui_gn,
+                         p_{g,t0}, f_{l,t0}, md_{n,t0}, 
+                         p_{g,t1}, f_{l,t1}, md_{n,t1}, ..., 
+                         p_{g,tn}, f_{l,tn}, md_{n,tn}] """
+
+        # coeff vector of zero's to be filled
+        c = torch.zeros(self.num_g + self.n_var_per_t*self.sample_duration, dtype=torch.float64)
+
         for g_idx, g in enumerate(self.G):
-            for t_idx in range(self.sample_duration):
-                index_p = self._get_index_p(g_idx, t_idx)
-                c[index_p] = self.pWeight * self.pVarCost[g]
-        
-        for n_idx, n in enumerate(self.N):
-            for t_idx in range(self.sample_duration):
-                index_md = self._get_index_md(n_idx, t_idx)
-                c[index_md] = self.pWeight * self.pVOLL
-        
-        for g_idx, g in enumerate(self.G):
-            index_ui = self._get_index_ui(g_idx)
-            c[index_ui] = self.pInvCost[g] * self.pUnitCap[g]
-        
-        return torch.tensor(c)
+            c[g_idx] = self.pInvCost[g] * self.pUnitCap[g]
+
+        for t in range(self.sample_duration):
+            # Sum over G,T (PC_g * p_{g,t}) --> Generation costs
+            for idx_g, g in enumerate(self.G):
+                # Generator variables are always at first |G| indices per timestep
+                coeff_idx = t * self.n_var_per_t + idx_g
+                c[coeff_idx] = self.pVarCost[g]
+
+            # Sum over N,T (MDC * md_{n,t}) --> Cost missed demand
+            for idx_n in range(self.num_n):
+                # Missed demand variables come after generator and lineflow variables
+                coeff_idx = t * self.n_var_per_t + self.num_g + self.num_l + idx_n
+                c[coeff_idx] = self.pVOLL
+
+        return c
 
     def build_X(self,):
         X = []
@@ -202,68 +253,6 @@ class GEPProblemSet():
                     x.append(self.pGenAva.get((*g, t), 1.0))
             X.append(x)
         return torch.tensor(X)
-
-    def scale_X(self, X):
-        # ! Scaling does not help!
-        # Compute sizes for pDemand and pGenAva based on input dimensions
-        pDemand_size = len(self.N) * self.sample_duration
-        pGenAva_size = len(self.G) * self.sample_duration
-
-        # Split X into demand and generation availability parts
-        X_demand = X[:, :pDemand_size].flatten().reshape(-1, 1)  # Flatten to 1D array for scaling
-        X_genava = X[:, pDemand_size:].flatten().reshape(-1, 1)
-
-        # Initialize scalers
-        scaler_demand = StandardScaler()
-        scaler_gen_ava = StandardScaler()
-
-        # Fit and transform each part
-        pDemand_scaled = scaler_demand.fit_transform(X_demand)  # Scale demand
-        pGenAva_scaled = scaler_gen_ava.fit_transform(X_genava)  # Scale generation availability
-
-        # Reshape scaled data back to original shapes
-        pDemand_scaled = pDemand_scaled.reshape(X[:, :pDemand_size].shape)  # Reshape to original demand shape
-        pGenAva_scaled = pGenAva_scaled.reshape(X[:, pDemand_size:].shape)  # Reshape to original generation availability shape
-
-        # Combine scaled parts into a single tensor
-        X_scaled = torch.cat([
-            torch.tensor(pDemand_scaled, dtype=self.DTYPE),
-            torch.tensor(pGenAva_scaled, dtype=self.DTYPE)
-        ], dim=1)
-
-        return X_scaled
-
-    def scale_Y_coeff(self):
-        # TODO: Only for first sample now.
-        opt_decision_variables = self.opt_targets[0]["y"]
-        p_gt_idx = len(self.G)*self.sample_duration
-        f_lt_idx = p_gt_idx + len(self.L)*self.sample_duration
-        md_nt_idx = f_lt_idx + len(self.N)*self.sample_duration
-        ui_g_idx = md_nt_idx + len(self.G)
-        p_gt = opt_decision_variables[:p_gt_idx].unsqueeze(0).reshape(-1,1)
-        f_lt = opt_decision_variables[p_gt_idx:f_lt_idx].unsqueeze(0).reshape(-1,1)
-        md_nt = opt_decision_variables[f_lt_idx:md_nt_idx].unsqueeze(0).reshape(-1,1)
-        ui_g = opt_decision_variables[md_nt_idx:].unsqueeze(0).reshape(-1,1)
-
-        # Scale each distribution separately
-        scaler_p = StandardScaler()
-        scaler_f = StandardScaler()
-        scaler_md = StandardScaler()
-        scaler_ui = StandardScaler()
-
-        p_scaled = scaler_p.fit_transform(p_gt)
-        f_scaled = scaler_f.fit_transform(f_lt)
-        md_scaled = scaler_md.fit_transform(md_nt)
-        ui_scaled = scaler_ui.fit_transform(ui_g)
-
-        p_coeff = torch.tensor(scaler_p.inverse_transform(np.ones_like(p_gt)))
-        f_coeff = torch.tensor(scaler_f.inverse_transform(np.ones_like(f_lt)))
-        md_coeff = torch.tensor(scaler_md.inverse_transform(np.ones_like(md_nt)))
-        ui_coeff = torch.tensor(scaler_ui.inverse_transform(np.ones_like(ui_g)))
-
-        Y_coeff = torch.concat([p_coeff, f_coeff, md_coeff, ui_coeff])
-        return Y_coeff.squeeze()
-
 
     def build_ineq_cm_rhs(self,):
         ineq_cms = []
@@ -287,243 +276,101 @@ class GEPProblemSet():
         
         return torch.tensor(np.array(eq_cms)), torch.tensor(np.array(eq_rhss))
     
+    # Bounds are always identity, -1 for lower bounds, +1 for upper bounds.
+    def assign_identity_or_scalar(self, matrix, row_start, col_start, size, value=1):
+        """ Assign identity matrix if size > 1, otherwise assign a scalar value. """
+        if size > 1:
+            matrix[row_start:row_start + size, col_start:col_start + size] = value*torch.eye(size)
+        else:
+            matrix[row_start, col_start] = value
+
     def build_ineq_cm_rhs_sample(self, time_range):
-        """Build the constraint matrix for the inequality constraints
+        """For a single data sample characterised by the time_range, 
+        build the full inequality constraint matrix for all timesteps using Kronecker product.
         """
 
-        # Initialize lists for the constraint matrix and RHS
-        ineq_cm = []
+        # TODO: Convert to sparse matrices for efficiency??
+
+        num_timesteps = len(time_range)
+        num_columns_per_t = self.n_var_per_t
+
+        # Compute number of constraint rows per timestep
+        num_rows_per_t = 2 * (self.num_g + self.num_l + self.num_n)
+
+        # Create a single block for one timestep
+        block_matrix = torch.zeros((num_rows_per_t, num_columns_per_t))
+
+        # Apply constraints
+        # Bounds are always identity, -1 for lower bounds, +1 for upper bounds.
+        self.assign_identity_or_scalar(block_matrix, 0, 0, self.num_g, -1) # 3.1h: Production lower bound
+        self.assign_identity_or_scalar(block_matrix, self.num_g, 0, self.num_g, 1) # 3.1b: Production upper bound
+        self.assign_identity_or_scalar(block_matrix, 2*self.num_g, self.num_g, self.num_l, -1) # 3.1d: Lineflow lower bound
+        self.assign_identity_or_scalar(block_matrix, 2*self.num_g + self.num_l, self.num_g, self.num_l, 1) # 3.1e: Lineflow upper bound
+        self.assign_identity_or_scalar(block_matrix, 2*self.num_g + 2*self.num_l, self.num_g + self.num_l, self.num_n, -1) # 3.1i: Missed demand lower bound
+        self.assign_identity_or_scalar(block_matrix, 2*self.num_g + 2*self.num_l + self.num_n, self.num_g + self.num_l, self.num_n, 1)  # 3.1j: Missed demand upper bound
+
+        # Use Kronecker product to copy the block matrix diagonally for all timesteps
+        ineq_cm = torch.kron(torch.eye(num_timesteps), block_matrix)
+
+        # 3.1k, ui_g lower bound
+        # prepend ui_g to top left corner. lower bound, so minus.
+        ui_g = -torch.eye(self.num_g)
+        ineq_cm = torch.block_diag(ui_g, ineq_cm)
+
+        row_offset = self.num_g # offset first g for 3.1k
+        row_offset += self.num_g # offset 3.1h
+        for t in time_range:
+            for idx_g, g in enumerate(self.G):
+                row_idx = row_offset + idx_g
+                print(self.pGenAva.get((*g, t), 1.0) * self.pUnitCap[g], row_idx, idx_g)
+                # GA_{g,t} * UCAP_g * ui_g
+                ineq_cm[row_idx, idx_g] = -(self.pGenAva.get((*g, t), 1.0) * self.pUnitCap[g])
+            row_offset += num_rows_per_t
+
+
         ineq_rhs = []
-
-        # Build constraints by calling specific functions for each constraint
-        self._add_max_production_constraints(ineq_cm, ineq_rhs, time_range) # 3.1 b
-        self._add_line_flow_constraints(ineq_cm, ineq_rhs, time_range) # 3.1 d,e
-        self._add_ramping_constraints(ineq_cm, ineq_rhs, time_range) # 3.1 f,g
-        self._add_non_negative_constraints(ineq_cm, ineq_rhs, time_range) # 3.1 h
-        self._add_missed_demand_constraints(ineq_cm, ineq_rhs, time_range) # 3.1 i, j
-        self._add_non_negative_geninv_constraints(ineq_cm, ineq_rhs, time_range) # 3.1 k
-
-        # TODO: Convert to sparse matrix for efficiency??
-        ineq_cm = np.array(ineq_cm)
-        ineq_rhs = np.array(ineq_rhs)
-
+        # Create right hand side:
+        # 3.1k: ui_g lower bound
+        ineq_rhs += [0 for _ in range(self.num_g)]
+        for t in time_range:
+            # 3.1h: Production lower bound
+            ineq_rhs += [0 for _ in range(self.num_g)]
+            # 3.1b: Production upper bound
+            ineq_rhs += [0 for _ in range(self.num_g)]
+            # 3.1d: Lineflow lower bound
+            ineq_rhs += [self.pImpCap[l] for l in self.L]
+            # 3.1e: Lineflow upper bound
+            ineq_rhs += [self.pExpCap[l] for l in self.L]
+            # 3.1i: Missed demand lower bound
+            ineq_rhs += [0 for _ in range(self.num_n)]
+            # 3.1j: Missed demand upper bound
+            ineq_rhs += [self.pDemand[(n, t)] for n in self.N]
+            
         return ineq_cm, ineq_rhs
-    
+
     def build_eq_cm_rhs_sample(self, time_range):
         """Build the constraint matrix for the equality constraints
         """
-        eq_cm = []
-        eq_rhs = []
-
-        self._add_node_balance_constraints(eq_cm=eq_cm, eq_rhs=eq_rhs, time_range=time_range)
-
         # TODO: Convert to sparse matrix for efficiency??
-        eq_cm = eq_cm
-        eq_rhs = np.array(eq_rhs)
+        num_timesteps = len(time_range)
+
+        # p_{g}, f_in - f_out, md_n
+        block_matrix = torch.concat([self.node_to_gen_mask, self.lineflow_mask, torch.eye(self.num_n)], dim=1)
+
+        # Use Kronecker product to copy the block matrix diagonally for all timesteps
+        eq_cm = torch.kron(torch.eye(num_timesteps), block_matrix)
+
+        # prepend num_g columns of zeros (ui_g not present in equality constraint matrix, so zeros)
+        zero_columns = torch.zeros((eq_cm.shape[0], self.num_g))
+        # Concatenate zero_columns with eq_cm horizontally
+        eq_cm = torch.hstack([zero_columns, eq_cm])
+
+        eq_rhs = []
+        # Build right hand side:
+        for t in time_range:
+            eq_rhs += [self.pDemand[(n, t)] for n in self.N]
 
         return eq_cm, eq_rhs
-
-    def _add_max_production_constraints(self, ineq_cm, rhs, time_range):
-        """Add maximum production constraints (3.1b)."""
-        for idx_g, g in enumerate(self.G):
-            for idx_t, t in enumerate(time_range):
-                row = self._create_empty_row()
-                # Coefficients for p_{g,t}
-                idx_p_gt = self._get_index_p(idx_g, idx_t)
-                row[idx_p_gt] = 1
-
-                # Coefficients for ui_g
-                idx_ui_g = self._get_index_ui(idx_g)
-                row[idx_ui_g] = -self.pGenAva.get((*g, t), 1.0) * self.pUnitCap[g]
-
-                ineq_cm.append(row)
-                rhs.append(0)
-
-    def _add_line_flow_constraints(self, ineq_cm, rhs, time_range):
-        """Add line flow constraints (3.1d and 3.1e)."""
-        lb_cm = []
-        ub_cm = []
-        lb_rhs = []
-        ub_rhs = []
-
-        for idx_l, l in enumerate(self.L):
-            for idx_t, t in enumerate(time_range):
-                row_lb = self._create_empty_row()
-                row_ub = row_lb.copy()
-
-                # Coefficients for f_{l,t}
-                idx_f_lt = self._get_index_f(idx_l, idx_t)
-                row_lb[idx_f_lt] = -1
-                row_ub[idx_f_lt] = 1
-
-                lb_cm.append(row_lb)
-                lb_rhs.append(self.pImpCap[l])
-
-                ub_cm.append(row_ub)
-                ub_rhs.append(self.pExpCap[l])
-        
-        # Add after eachother to ensure consistency in order with math formula's
-        # 3.1d
-        ineq_cm += lb_cm
-        rhs += lb_rhs
-        # 3.1e
-        ineq_cm += ub_cm
-        rhs += ub_rhs
-
-    def _add_ramping_constraints(self, ineq_cm, rhs, time_range):
-        """Add ramping constraints (3.1f and 3.1g)."""
-        down_cm = []
-        up_cm = []
-        down_rhs = []
-        up_rhs = []
-        for idx_g, g in enumerate(self.G):
-            for idx_t, t in enumerate(time_range[1:], start=1):  # Start indexing from 1
-                row_down = self._create_empty_row()
-                row_up = row_down.copy()
-
-                # Coefficients for p_{g,t} and p_{g,t-1}
-                idx_p_gt = self._get_index_p(idx_g, idx_t)
-                idx_p_gt_prev = self._get_index_p(idx_g, idx_t - 1)
-
-                # 3.1f
-                row_down[idx_p_gt] = -1
-                row_down[idx_p_gt_prev] = 1
-
-                # 3.1g
-                row_up[idx_p_gt] = 1
-                row_up[idx_p_gt_prev] = -1
-
-                # Coefficients for ui_g
-                idx_ui_g = self._get_index_ui(idx_g)
-                ramping_term = self.pRamping * self.pUnitCap[g]
-                row_down[idx_ui_g] = -ramping_term
-                row_up[idx_ui_g] = -ramping_term
-
-                down_cm.append(row_down)
-                down_rhs.append(0)
-
-                up_cm.append(row_up)
-                up_rhs.append(0)
-        # 3.1f
-        ineq_cm += down_cm
-        rhs += down_rhs
-        # 3.1g
-        ineq_cm += up_cm
-        rhs += up_rhs
-
-    def _add_non_negative_constraints(self, ineq_cm, rhs, time_range):
-        """Add non-negativity constraints (3.1h)."""
-        for idx_g, g in enumerate(self.G):
-            for idx_t, t in enumerate(time_range):
-                row = self._create_empty_row()
-
-                # Coefficients for p_{g,t}
-                idx_p_gt = self._get_index_p(idx_g, idx_t)
-                row[idx_p_gt] = -1
-
-                ineq_cm.append(row)
-                rhs.append(0)
-
-    def _add_missed_demand_constraints(self, ineq_cm, rhs, time_range):
-        """Add missed demand constraints (3.1i and 3.1j)."""
-        lb_cm = []
-        lb_rhs = []
-        ub_cm = []
-        ub_rhs = []
-        for idx_n, n in enumerate(self.N):
-            for idx_t, t in enumerate(time_range):
-                row_lb = self._create_empty_row()
-                row_ub = row_lb.copy()
-
-                # Coefficients for md_{n,t}
-                idx_md_nt = self._get_index_md(idx_n, idx_t)
-                row_lb[idx_md_nt] = -1
-                row_ub[idx_md_nt] = 1
-
-                lb_cm.append(row_lb)
-                lb_rhs.append(0)
-
-                ub_cm.append(row_ub)
-                ub_rhs.append(self.pDemand[(n, t)])
-        # 3.1i
-        ineq_cm += lb_cm
-        rhs += lb_rhs
-        # 3.1j
-        ineq_cm += ub_cm
-        rhs += ub_rhs
-    
-    # 3.1 k
-    def _add_non_negative_geninv_constraints(self, ineq_cm, ineq_rhs, time_range):
-        for idx_g, g in enumerate(self.G):
-            row = self._create_empty_row()
-            index_ui_g = self._get_index_ui(idx_g)
-            row[index_ui_g] = -1
-
-            ineq_cm.append(row)
-            ineq_rhs.append(0)
-    
-    def _add_node_balance_constraints(self, eq_cm, eq_rhs, time_range):
-        """
-        Add node balance constraints using precomputed masks and efficient operations.
-        """
-
-        # Precompute sparse row templates for efficiency
-        row_template = self._create_empty_row()
-
-        for idx_t, t in enumerate(time_range):
-            for idx_n, n in enumerate(self.N):
-                row = row_template.copy()  # Start with a blank row
-
-                # Add generator coefficients (p_{g,t})
-                generator_indices = np.where(self.gen_to_node_mask[idx_n])[0]
-                row[[self._get_index_p(idx_g, idx_t) for idx_g in generator_indices]] = 1
-
-                # Add incoming flow coefficients (f_{l,t})
-                incoming_indices = np.where(self.incoming_mask[idx_n])[0]
-                row[[self._get_index_f(idx_l_in, idx_t) for idx_l_in in incoming_indices]] = 1
-
-                # Add outgoing flow coefficients (f_{l,t})
-                outgoing_indices = np.where(self.outgoing_mask[idx_n])[0]
-                row[[self._get_index_f(idx_l_out, idx_t) for idx_l_out in outgoing_indices]] = -1
-
-                # Add missed demand coefficients (md_{n,t})
-                idx_md_nt = self._get_index_md(idx_n, idx_t)
-                row[idx_md_nt] = 1
-
-                # Append row and RHS to the constraint matrix
-                eq_cm.append(row)
-                eq_rhs.append(self.pDemand[(n, t)])
-
-    def _get_generators_connected_to_node(self, node):
-        """Return a list of generators connected to the given node."""
-        return [g for g in self.G if self._generator_node_map[g] == node]
-
-    def _get_lines_starting_at_node(self, node):
-        """Return a list of lines starting at the given node."""
-        return [l for l in self.L if self._line_start_node_map[l] == node]
-
-    def _get_lines_ending_at_node(self, node):
-        """Return a list of lines ending at the given node."""
-        return [l for l in self.L if self._line_end_node_map[l] == node]
-    
-    def _create_empty_row(self,):
-        return np.zeros(len(self.G) * self.sample_duration + len(self.L) * self.sample_duration + len(self.N) * self.sample_duration + len(self.G))
-
-    def _get_index_p(self, idx_g, idx_t):
-        """Get the index of p_{g,t} in the flattened decision variable vector."""
-        return idx_g * self.sample_duration + idx_t
-
-    def _get_index_f(self, idx_l, idx_t):
-        """Get the index of f_{l,t} in the flattened decision variable vector."""
-        return self.index_f_offset + idx_l * self.sample_duration + idx_t
-
-    def _get_index_md(self, idx_n, idx_t):
-        """Get the index of md_{n,t} in the flattened decision variable vector."""
-        return self.index_md_offset + idx_n * self.sample_duration + idx_t
-
-    def _get_index_ui(self, idx_g):
-        """Get the index of ui_g in the flattened decision variable vector."""
-        return self.index_ui_offset + idx_g
 
     def _split_X_in_sets(self, train=0.8, valid=0.1, test=0.1):
         # Ensure the split ratios sum to 1
@@ -553,3 +400,63 @@ class GEPProblemSet():
         print(f"Size of train set: {train_size}")
         print(f"Size of val set: {valid_size}")
         print(f"Size of test set: {B - train_size - valid_size}")
+
+if __name__ == "__main__":
+    import pickle
+    import time
+    import json
+
+    from gep_config_parser import *
+
+    from gep_primal_dual_main import prep_data
+
+    CONFIG_FILE_NAME        = "config.toml"
+    VISUALIZATION_FILE_NAME = "visualization.toml"
+
+    ## Step 1: parse the input data
+    print("Parsing the config file")
+
+    data = parse_config(CONFIG_FILE_NAME)
+    experiment = data["experiment"]
+    outputs_config = data["outputs_config"]
+
+    with open("config.json", "r") as file:
+        args = json.load(file)
+    
+    print(args)
+
+    # Train the model:
+    for i, experiment_instance in enumerate(experiment["experiments"]):
+        # Setup output dataframe
+        df_res = pd.DataFrame(columns=["setup_time", "presolve_time", "barrier_time", "crossover_time", "restore_time", "objective_value"])
+
+        for j in range(experiment["repeats"]):
+            # Run one experiment for j repeats
+            run_name = f"refactored_train:{args['train']}_rho:{args['rho']}_rhomax:{args['rho_max']}_alpha:{args['alpha']}_L:{args['alpha']}"
+            save_dir = os.path.join('outputs', 'PDL',
+                run_name + "-" + str(time.time()).replace('.', '-'))
+            if not os.path.exists(save_dir):
+                os.makedirs(save_dir)
+            with open(os.path.join(save_dir, 'args.dict'), 'wb') as f:
+                pickle.dump(args, f)
+            
+            # Prep proble data:
+            data = prep_data(experiment_instance, N=args["N"], G=args["G"], L=args["L"], train=args["train"], valid=args["valid"], test=args["test"], scale=args["scale_problem"], sample_duration=args["sample_duration"], constant_gen_inv=args["operational"])
+    
+    # Create figure and axes
+    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+
+    # Plot each matrix as a heatmap
+    matrices = [data.eq_cm[0], data.eq_rhs[0].unsqueeze(-1), data.ineq_cm[0], data.ineq_rhs[0].unsqueeze(-1), data.obj_coeff.unsqueeze(-1)]
+    titles = ["eq_cm", "eq_rhs", "ineq_cm", "ineq_rhs", "obj_coeff"]
+
+    for ax, matrix, title in zip(axes, matrices, titles):
+        im = ax.imshow(matrix, cmap='viridis', aspect='auto')
+        ax.set_title(title)
+        ax.set_xlabel("Columns")
+        ax.set_ylabel("Rows")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)  # Add colorbar
+
+    # Adjust layout and show plot
+    plt.tight_layout()
+    plt.show()
