@@ -1,17 +1,15 @@
-import torch
 import numpy as np
+import torch
+import pickle
+from sklearn.preprocessing import StandardScaler
 
-class GEPProblem():
 
-    def __init__(self, T, G, L, N, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, sample_duration=12, shuffle=False):
-        # self.DTYPE = torch.float32
-        # self.DEVICE = (
-        #     torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
-        # )
+class GEPProblemSet():
 
+    def __init__(self, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, sample_duration=12, train=0.8, valid=0.1, test=0.1):
+        # ! Assume y = [p_{g,t}, f_{l,t}, md_{n,t}, ui_g]
         self.DTYPE = torch.float64
         self.DEVICE = torch.device="cpu"
-
         torch.set_default_dtype(self.DTYPE)
 
         # Input Sets
@@ -19,7 +17,7 @@ class GEPProblem():
         self.G = G
         self.L = L
         self.N = N
-        # Input Parameters
+        # Input Parameters (Dictionaries)
         self.pDemand = pDemand
         self.pGenAva = pGenAva
         self.pVOLL = pVOLL
@@ -30,625 +28,528 @@ class GEPProblem():
         self.pUnitCap = pUnitCap
         self.pExpCap = pExpCap
         self.pImpCap = pImpCap
-        self.sample_duration = sample_duration
-        self.shuffle = shuffle
 
+        # Number of timesteps per data sample
+        assert (float(len(T)) / sample_duration).is_integer() # Total number of timesteps should be divisible by the number of timesteps per data sample.
+        self.sample_duration = sample_duration
+
+        # Time slices, each slice makes a different sample.
         self.time_ranges = [range(i, i + sample_duration, 1) for i in range(1, len(T), sample_duration)]
 
-        # Convert dictionaries to tensors
-        self.pDemand_tensor = torch.tensor( # (N, T)
-            [[pDemand[(n, t)] for t in self.T] for n in self.N],
-            device=self.DEVICE,
-            dtype=self.DTYPE
-        )
+        self.index_f_offset = len(self.G) * self.sample_duration
+        self.index_md_offset = len(self.G) * self.sample_duration + len(self.L) * self.sample_duration
+        self.index_ui_offset = len(self.G) * self.sample_duration + len(self.L) * self.sample_duration + len(self.N) * self.sample_duration
 
-        self.pGenAva_tensor = torch.tensor( # (G, T)
-            [[pGenAva.get((*g, t), 1.0) for t in self.T] for g in self.G],
-            device=self.DEVICE,
-            dtype=self.DTYPE
-        )
+        # Known optimal values from Gurobi.
+        # file_path = f"outputs/Gurobi/OPERATIONAL={False}_GEP_OPT_TARGETS_T={self.sample_duration}"
+        #! All generators:
+        # file_path = "outputs/Gurobi/ALL_GENERATORS-OPERATIONAL=False-GEP_OPT_TARGETS_T=12"
+        #! Sun and gas generators:
+        # file_path = "outputs/Gurobi/SUN_AND_GAS-OPERATIONAL=False-GEP_OPT_TARGETS_T=12"
+        #! Only BEL, GER and Gas generators
+        file_path = "outputs/Gurobi/BEL_GER_GAS-OPERATIONAL=False-GEP_OPT_TARGETS_T=12"
+        with open(file_path, 'rb') as file:
+            self._opt_targets = pickle.load(file)
 
-        self.pVOLL_tensor = torch.tensor(pVOLL, device=self.DEVICE, dtype=self.DTYPE)
-        self.pWeight_tensor = torch.tensor(pWeight, device=self.DEVICE, dtype=self.DTYPE)
-        self.pRamping_tensor = torch.tensor(pRamping, device=self.DEVICE, dtype=self.DTYPE)
+        self._generator_node_map = {g: connected_node for connected_node, g in self.G}
+        self._line_start_node_map = {start_node: end_node for start_node, end_node in self.L}
+        self._line_end_node_map = {end_node: start_node for start_node, end_node in self.L}
 
-        self.pInvCost_tensor = torch.tensor( # (G,)
-            [pInvCost[g] for g in self.G],
-            device=self.DEVICE,
-            dtype=self.DTYPE
-        )
+        # Masks for node balance!
+        # Initialize mask
+        self.gen_to_node_mask = np.zeros((len(N), len(G)), dtype=int)
 
-        self.pVarCost_tensor = torch.tensor( # (G,)
-            [pVarCost[g] for g in self.G],
-            device=self.DEVICE,
-            dtype=self.DTYPE
-        )
-
-        self.pUnitCap_tensor = torch.tensor( # (G,)
-            [pUnitCap[g] for g in self.G],
-            device=self.DEVICE,
-            dtype=self.DTYPE
-        )
-        self.pExpCap_tensor = torch.tensor( # (L,)
-            [pExpCap[l] for l in self.L],
-            device=self.DEVICE,
-            dtype=self.DTYPE
-        )
-
-        self.pImpCap_tensor = torch.tensor( # (L,)
-            [pImpCap[l] for l in self.L],
-            device=self.DEVICE,
-            dtype=self.DTYPE
-        )
+        # Populate mask
+        for g_idx, (node, _) in enumerate(G):
+            node_idx = N.index(node)
+            self.gen_to_node_mask[node_idx, g_idx] = 1
         
-        self.X = self._split_X_in_batches()
-        self._trainX, self._validX, self._testX = self._split_X_in_sets(self.X)
+        # Initialize masks
+        self.incoming_mask = np.zeros((len(N), len(L)), dtype=int)
+        self.outgoing_mask = np.zeros((len(N), len(L)), dtype=int)
 
-
-        self.vGenProd_size = len(self.G) * self.sample_duration  # Forall g in G, t in T
-        self.vLineFlow_size = len(self.L) * self.sample_duration # Forall l in L, t in T
-        self.vLossLoad_size = len(self.N) * self.sample_duration # Forall n in N, t in T
-        self.vGenInv_size = len(self.G) # Forall g in G
-
-        self.y_size = self.vGenProd_size + self.vLineFlow_size + self.vLossLoad_size + self.vGenInv_size
-
-        self._xdim = self.X.shape[1]
-        self._ydim = self.y_size
-
-        self.num_ineq_constraints = (len(self.G) * self.sample_duration + # 3.1b
-                                     len(self.L) * self.sample_duration + # 3.1d
-                                     len(self.L) * self.sample_duration + # 3.1e
-                                     len(self.G) * (self.sample_duration-1) + # 3.1f
-                                     len(self.G) * (self.sample_duration-1) + # 3.1g
-                                     len(self.G) * self.sample_duration + # 3.1h
-                                     len(self.N) * self.sample_duration + # 3.1i
-                                     len(self.N) * self.sample_duration + # 3.1j
-                                     len(self.G))           # 3.1k
+        # Populate masks
+        for l_idx, (start_node, end_node) in enumerate(L):
+            start_idx = N.index(start_node)
+            end_idx = N.index(end_node)
+            self.outgoing_mask[start_idx, l_idx] = 1
+            self.incoming_mask[end_idx, l_idx] = 1
         
-        self.num_eq_constraints = len(self.N) * self.sample_duration # 3.1c
-        self.num_variables = (len(self.G) + len(self.L) + len(self.N)) * self.sample_duration + len(self.G)
-        self.num_inputs = (len(self.N) * self.sample_duration) + (len(self.G) * self.sample_duration)
+        # Create constraint matrices, rhs and obj_fns
+        print("Populating ineq constraints")
+        self.ineq_cm, self.ineq_rhs = self.build_ineq_cm_rhs()
+        print("Populating eq constraints")
+        self.eq_cm, self.eq_rhs = self.build_eq_cm_rhs()
+        print("Creating objective coefficients")
+        self.obj_coeff = self.build_obj_coeff()
+        print("Creating input for NN: X")
+        self.X = self.build_X()
 
-        print(f"Size of mu: {self.num_ineq_constraints}")
-        print(f"Size of lambda: {self.num_eq_constraints}")
-        print(f"Number of variables (size of y): {self.num_variables}")
-        print(f"Number of inputs (size of X): {self.num_inputs}")
-        # print(f"Size of X: {self.X.shape[1]}")
+        self.X_scaled = self.scale_X(self.X)
+        # self.y_coeff = self.scale_Y_coeff()
 
-        # Create masks for e_nodebal (node balancing rule).
-        self._generate_nodebal_masks()
+        self.neq = self.eq_cm.shape[1]
+        self.nineq = self.ineq_cm.shape[1]
+        self.ydim = len(self.obj_coeff)
+        self.xdim = self.X.shape[1]
 
-    @property
-    def trainX(self):
-        return self._trainX
-    
-    @property
-    def validX(self):
-        return self._validX
-    
-    @property
-    def testX(self):
-        return self._testX
-    
-    @property
-    def train_time_ranges(self):
-        return self._train_time_ranges
-    
-    @property
-    def val_time_ranges(self):
-        return self._val_time_ranges
+        # Variable indices, to extract variables from Y
+        self.p_gt_indices = range(0, self.index_f_offset)
+        self.f_lt_indices = range(self.index_f_offset, self.index_md_offset)
+        self.md_nt_indices = range(self.index_md_offset, self.index_ui_offset)
+        self.ui_g_indices = range(self.index_ui_offset, self.ydim)
 
+        # Constraint indices, to extract specific constraint residuals
+        # eq constraints: only eq 3.1c
+        self.constraint_c_indices = range(self.neq)
+
+        # ineq constraints: b,d,e,f,g,h,i,j,k
+        self.constraint_b_offset = 0
+        self.constraint_d_offset = self.constraint_b_offset + len(self.G)*self.sample_duration 
+        self.constraint_e_offset = self.constraint_d_offset + len(self.L)*self.sample_duration 
+        self.constraint_f_offset = self.constraint_e_offset + len(self.L)*self.sample_duration 
+        self.constraint_g_offset = self.constraint_f_offset + len(G)*(self.sample_duration - 1)
+        self.constraint_h_offset = self.constraint_g_offset + len(G)*(self.sample_duration - 1)
+        self.constraint_i_offset = self.constraint_h_offset + len(G)*self.sample_duration 
+        self.constraint_j_offset = self.constraint_i_offset + len(N)*self.sample_duration 
+        self.constraint_k_offset = self.constraint_j_offset + len(N)*self.sample_duration 
+
+        self.constraint_b_indices = range(self.constraint_b_offset, self.constraint_d_offset)
+        self.constraint_d_indices = range(self.constraint_d_offset, self.constraint_e_offset)
+        self.constraint_e_indices = range(self.constraint_e_offset, self.constraint_f_offset)
+        self.constraint_f_indices = range(self.constraint_f_offset, self.constraint_g_offset)
+        self.constraint_g_indices = range(self.constraint_g_offset, self.constraint_h_offset)
+        self.constraint_h_indices = range(self.constraint_h_offset, self.constraint_i_offset)
+        self.constraint_i_indices = range(self.constraint_i_offset, self.constraint_j_offset)
+        self.constraint_j_indices = range(self.constraint_j_offset, self.constraint_k_offset)
+        self.constraint_k_indices = range(self.constraint_k_offset, self.nineq)
+
+        # Split x into training, val, test sets.
+        self._split_X_in_sets(train, valid, test)
+        
+    
+    # Split the data
     @property
-    def xdim(self):
-        return self._xdim
+    def train_indices(self): return self._train_indices
+    @property
+    def valid_indices(self): return self._valid_indices
+    @property
+    def test_indices(self): return self._test_indices
     
     @property
-    def ydim(self):
-        return self._ydim
+    def opt_targets(self): return self._opt_targets
     
-    def _split_X_in_batches(self):
-        """As input to the primal and dual nets, we use only the parameters that change over time (D_{n,t} and GA_{g,t})
+    def set_train_extractor(self, train_extractor):
+        self.train_extractor = train_extractor
+    
+    def set_valid_extractor(self, valid_extractor):
+        self.valid_extractor = valid_extractor
+
+    def ineq_resid(self, Y, ineq_cm, ineq_rhs):
+        # Y *= self.y_coeff
+        return torch.bmm(ineq_cm, Y.unsqueeze(-1)).squeeze(-1) - ineq_rhs
+
+    def eq_resid(self, Y, eq_cm, eq_rhs):
+        # Y *= self.y_coeff
+        return torch.bmm(eq_cm, Y.unsqueeze(-1)).squeeze(-1) - eq_rhs
+
+    def obj_fn(self, Y):
+        # obj_coeff does not need batching, objective is the same over different samples.
+        # Y *= self.y_coeff
+        return self.obj_coeff @ Y.T
+    
+    def dual_obj_fn(self, eq_rhs, ineq_rhs, mu, lamb):
+        # Batched dot product
+        ineq_term = torch.sum(mu * ineq_rhs, dim=1)
+        
+        # Batched dot product
+        eq_term = torch.sum(lamb * eq_rhs, dim=1)
+
+        return -(ineq_term + eq_term)
+    
+    def ineq_dist(self, Y, ineq_cm, ineq_rhs):
+        resids = self.ineq_resid(Y, ineq_cm, ineq_rhs)
+        return torch.clamp(resids, 0)
+    
+    def build_obj_coeff(self,):
+        # ! Assume y = [p_{g,t}, f_{l,t}, md_{n,t}, ui_g]
+        c = self._create_empty_row()
+        for g_idx, g in enumerate(self.G):
+            for t_idx in range(self.sample_duration):
+                index_p = self._get_index_p(g_idx, t_idx)
+                c[index_p] = self.pWeight * self.pVarCost[g]
+        
+        for n_idx, n in enumerate(self.N):
+            for t_idx in range(self.sample_duration):
+                index_md = self._get_index_md(n_idx, t_idx)
+                c[index_md] = self.pWeight * self.pVOLL
+        
+        for g_idx, g in enumerate(self.G):
+            index_ui = self._get_index_ui(g_idx)
+            c[index_ui] = self.pInvCost[g] * self.pUnitCap[g]
+        
+        return torch.tensor(c)
+
+    def build_X(self,):
+        X = []
+        for time_range in self.time_ranges:
+            x = []
+            for n in self.N:
+                for t in time_range:
+                    x.append(self.pDemand[(n, t)])
+            for g in self.G:
+                for t in time_range:
+                    x.append(self.pGenAva.get((*g, t), 1.0))
+            X.append(x)
+        return torch.tensor(X)
+
+    def scale_X(self, X):
+        # ! Scaling does not help!
+        # Compute sizes for pDemand and pGenAva based on input dimensions
+        pDemand_size = len(self.N) * self.sample_duration
+        pGenAva_size = len(self.G) * self.sample_duration
+
+        # Split X into demand and generation availability parts
+        X_demand = X[:, :pDemand_size].flatten().reshape(-1, 1)  # Flatten to 1D array for scaling
+        X_genava = X[:, pDemand_size:].flatten().reshape(-1, 1)
+
+        # Initialize scalers
+        scaler_demand = StandardScaler()
+        scaler_gen_ava = StandardScaler()
+
+        # Fit and transform each part
+        pDemand_scaled = scaler_demand.fit_transform(X_demand)  # Scale demand
+        pGenAva_scaled = scaler_gen_ava.fit_transform(X_genava)  # Scale generation availability
+
+        # Reshape scaled data back to original shapes
+        pDemand_scaled = pDemand_scaled.reshape(X[:, :pDemand_size].shape)  # Reshape to original demand shape
+        pGenAva_scaled = pGenAva_scaled.reshape(X[:, pDemand_size:].shape)  # Reshape to original generation availability shape
+
+        # Combine scaled parts into a single tensor
+        X_scaled = torch.cat([
+            torch.tensor(pDemand_scaled, dtype=self.DTYPE),
+            torch.tensor(pGenAva_scaled, dtype=self.DTYPE)
+        ], dim=1)
+
+        return X_scaled
+
+    def scale_Y_coeff(self):
+        # TODO: Only for first sample now.
+        opt_decision_variables = self.opt_targets[0]["y"]
+        p_gt_idx = len(self.G)*self.sample_duration
+        f_lt_idx = p_gt_idx + len(self.L)*self.sample_duration
+        md_nt_idx = f_lt_idx + len(self.N)*self.sample_duration
+        ui_g_idx = md_nt_idx + len(self.G)
+        p_gt = opt_decision_variables[:p_gt_idx].unsqueeze(0).reshape(-1,1)
+        f_lt = opt_decision_variables[p_gt_idx:f_lt_idx].unsqueeze(0).reshape(-1,1)
+        md_nt = opt_decision_variables[f_lt_idx:md_nt_idx].unsqueeze(0).reshape(-1,1)
+        ui_g = opt_decision_variables[md_nt_idx:].unsqueeze(0).reshape(-1,1)
+
+        # Scale each distribution separately
+        scaler_p = StandardScaler()
+        scaler_f = StandardScaler()
+        scaler_md = StandardScaler()
+        scaler_ui = StandardScaler()
+
+        p_scaled = scaler_p.fit_transform(p_gt)
+        f_scaled = scaler_f.fit_transform(f_lt)
+        md_scaled = scaler_md.fit_transform(md_nt)
+        ui_scaled = scaler_ui.fit_transform(ui_g)
+
+        p_coeff = torch.tensor(scaler_p.inverse_transform(np.ones_like(p_gt)))
+        f_coeff = torch.tensor(scaler_f.inverse_transform(np.ones_like(f_lt)))
+        md_coeff = torch.tensor(scaler_md.inverse_transform(np.ones_like(md_nt)))
+        ui_coeff = torch.tensor(scaler_ui.inverse_transform(np.ones_like(ui_g)))
+
+        Y_coeff = torch.concat([p_coeff, f_coeff, md_coeff, ui_coeff])
+        return Y_coeff.squeeze()
+
+
+    def build_ineq_cm_rhs(self,):
+        ineq_cms = []
+        ineq_rhss = []
+
+        for time_range in self.time_ranges:
+            ineq_cm, ineq_rhs = self.build_ineq_cm_rhs_sample(time_range)
+            ineq_cms.append(ineq_cm)
+            ineq_rhss.append(ineq_rhs)
+        
+        return torch.tensor(np.array(ineq_cms)), torch.tensor(np.array(ineq_rhss))
+
+    def build_eq_cm_rhs(self,):
+        eq_cms = []
+        eq_rhss = []
+
+        for time_range in self.time_ranges:
+            eq_cm, eq_rhs = self.build_eq_cm_rhs_sample(time_range)
+            eq_cms.append(eq_cm)
+            eq_rhss.append(eq_rhs)
+        
+        return torch.tensor(np.array(eq_cms)), torch.tensor(np.array(eq_rhss))
+    
+    def build_ineq_cm_rhs_sample(self, time_range):
+        """Build the constraint matrix for the inequality constraints
         """
-        # self.pDemand_tensor has shape [N, T]
-        # self.pGenAva_tensor has shape [G, T]
-        # Num Samples [B] = len(self.T) [8760] / self.sample_duration [12] = 730
-        # Output should be of shape [B, N*sample_duration + G*sample_duration][730, N*12 + G*12]
 
-        B = len(self.T) // self.sample_duration
-        # Reshape tensors directly for batching
-        pDemand_batched = self.pDemand_tensor.view(len(self.N), B, self.sample_duration).permute(1, 0, 2).reshape(B, -1)  # [B, N*sample_duration]
-        pGenAva_batched = self.pGenAva_tensor.view(len(self.G), B, self.sample_duration).permute(1, 0, 2).reshape(B, -1)  # [B, G*sample_duration]
+        # Initialize lists for the constraint matrix and RHS
+        ineq_cm = []
+        ineq_rhs = []
 
-        # Concatenate along the last dimension
-        batched_tensor = torch.cat((pDemand_batched, pGenAva_batched), dim=1)  # [B, N*sample_duration + G*sample_duration]
-        return batched_tensor
+        # Build constraints by calling specific functions for each constraint
+        self._add_max_production_constraints(ineq_cm, ineq_rhs, time_range) # 3.1 b
+        self._add_line_flow_constraints(ineq_cm, ineq_rhs, time_range) # 3.1 d,e
+        self._add_ramping_constraints(ineq_cm, ineq_rhs, time_range) # 3.1 f,g
+        self._add_non_negative_constraints(ineq_cm, ineq_rhs, time_range) # 3.1 h
+        self._add_missed_demand_constraints(ineq_cm, ineq_rhs, time_range) # 3.1 i, j
+        self._add_non_negative_geninv_constraints(ineq_cm, ineq_rhs, time_range) # 3.1 k
 
-    def _split_X_in_sets(self, X, train=0.8, valid=0.1, test=0.1):
+        # TODO: Convert to sparse matrix for efficiency??
+        ineq_cm = np.array(ineq_cm)
+        ineq_rhs = np.array(ineq_rhs)
+
+        return ineq_cm, ineq_rhs
+    
+    def build_eq_cm_rhs_sample(self, time_range):
+        """Build the constraint matrix for the equality constraints
+        """
+        eq_cm = []
+        eq_rhs = []
+
+        self._add_node_balance_constraints(eq_cm=eq_cm, eq_rhs=eq_rhs, time_range=time_range)
+
+        # TODO: Convert to sparse matrix for efficiency??
+        eq_cm = eq_cm
+        eq_rhs = np.array(eq_rhs)
+
+        return eq_cm, eq_rhs
+
+    def _add_max_production_constraints(self, ineq_cm, rhs, time_range):
+        """Add maximum production constraints (3.1b)."""
+        for idx_g, g in enumerate(self.G):
+            for idx_t, t in enumerate(time_range):
+                row = self._create_empty_row()
+                # Coefficients for p_{g,t}
+                idx_p_gt = self._get_index_p(idx_g, idx_t)
+                row[idx_p_gt] = 1
+
+                # Coefficients for ui_g
+                idx_ui_g = self._get_index_ui(idx_g)
+                row[idx_ui_g] = -self.pGenAva.get((*g, t), 1.0) * self.pUnitCap[g]
+
+                ineq_cm.append(row)
+                rhs.append(0)
+
+    def _add_line_flow_constraints(self, ineq_cm, rhs, time_range):
+        """Add line flow constraints (3.1d and 3.1e)."""
+        lb_cm = []
+        ub_cm = []
+        lb_rhs = []
+        ub_rhs = []
+
+        for idx_l, l in enumerate(self.L):
+            for idx_t, t in enumerate(time_range):
+                row_lb = self._create_empty_row()
+                row_ub = row_lb.copy()
+
+                # Coefficients for f_{l,t}
+                idx_f_lt = self._get_index_f(idx_l, idx_t)
+                row_lb[idx_f_lt] = -1
+                row_ub[idx_f_lt] = 1
+
+                lb_cm.append(row_lb)
+                lb_rhs.append(self.pImpCap[l])
+
+                ub_cm.append(row_ub)
+                ub_rhs.append(self.pExpCap[l])
+        
+        # Add after eachother to ensure consistency in order with math formula's
+        # 3.1d
+        ineq_cm += lb_cm
+        rhs += lb_rhs
+        # 3.1e
+        ineq_cm += ub_cm
+        rhs += ub_rhs
+
+    def _add_ramping_constraints(self, ineq_cm, rhs, time_range):
+        """Add ramping constraints (3.1f and 3.1g)."""
+        down_cm = []
+        up_cm = []
+        down_rhs = []
+        up_rhs = []
+        for idx_g, g in enumerate(self.G):
+            for idx_t, t in enumerate(time_range[1:], start=1):  # Start indexing from 1
+                row_down = self._create_empty_row()
+                row_up = row_down.copy()
+
+                # Coefficients for p_{g,t} and p_{g,t-1}
+                idx_p_gt = self._get_index_p(idx_g, idx_t)
+                idx_p_gt_prev = self._get_index_p(idx_g, idx_t - 1)
+
+                # 3.1f
+                row_down[idx_p_gt] = -1
+                row_down[idx_p_gt_prev] = 1
+
+                # 3.1g
+                row_up[idx_p_gt] = 1
+                row_up[idx_p_gt_prev] = -1
+
+                # Coefficients for ui_g
+                idx_ui_g = self._get_index_ui(idx_g)
+                ramping_term = self.pRamping * self.pUnitCap[g]
+                row_down[idx_ui_g] = -ramping_term
+                row_up[idx_ui_g] = -ramping_term
+
+                down_cm.append(row_down)
+                down_rhs.append(0)
+
+                up_cm.append(row_up)
+                up_rhs.append(0)
+        # 3.1f
+        ineq_cm += down_cm
+        rhs += down_rhs
+        # 3.1g
+        ineq_cm += up_cm
+        rhs += up_rhs
+
+    def _add_non_negative_constraints(self, ineq_cm, rhs, time_range):
+        """Add non-negativity constraints (3.1h)."""
+        for idx_g, g in enumerate(self.G):
+            for idx_t, t in enumerate(time_range):
+                row = self._create_empty_row()
+
+                # Coefficients for p_{g,t}
+                idx_p_gt = self._get_index_p(idx_g, idx_t)
+                row[idx_p_gt] = -1
+
+                ineq_cm.append(row)
+                rhs.append(0)
+
+    def _add_missed_demand_constraints(self, ineq_cm, rhs, time_range):
+        """Add missed demand constraints (3.1i and 3.1j)."""
+        lb_cm = []
+        lb_rhs = []
+        ub_cm = []
+        ub_rhs = []
+        for idx_n, n in enumerate(self.N):
+            for idx_t, t in enumerate(time_range):
+                row_lb = self._create_empty_row()
+                row_ub = row_lb.copy()
+
+                # Coefficients for md_{n,t}
+                idx_md_nt = self._get_index_md(idx_n, idx_t)
+                row_lb[idx_md_nt] = -1
+                row_ub[idx_md_nt] = 1
+
+                lb_cm.append(row_lb)
+                lb_rhs.append(0)
+
+                ub_cm.append(row_ub)
+                ub_rhs.append(self.pDemand[(n, t)])
+        # 3.1i
+        ineq_cm += lb_cm
+        rhs += lb_rhs
+        # 3.1j
+        ineq_cm += ub_cm
+        rhs += ub_rhs
+    
+    # 3.1 k
+    def _add_non_negative_geninv_constraints(self, ineq_cm, ineq_rhs, time_range):
+        for idx_g, g in enumerate(self.G):
+            row = self._create_empty_row()
+            index_ui_g = self._get_index_ui(idx_g)
+            row[index_ui_g] = -1
+
+            ineq_cm.append(row)
+            ineq_rhs.append(0)
+    
+    def _add_node_balance_constraints(self, eq_cm, eq_rhs, time_range):
+        """
+        Add node balance constraints using precomputed masks and efficient operations.
+        """
+
+        # Precompute sparse row templates for efficiency
+        row_template = self._create_empty_row()
+
+        for idx_t, t in enumerate(time_range):
+            for idx_n, n in enumerate(self.N):
+                row = row_template.copy()  # Start with a blank row
+
+                # Add generator coefficients (p_{g,t})
+                generator_indices = np.where(self.gen_to_node_mask[idx_n])[0]
+                row[[self._get_index_p(idx_g, idx_t) for idx_g in generator_indices]] = 1
+
+                # Add incoming flow coefficients (f_{l,t})
+                incoming_indices = np.where(self.incoming_mask[idx_n])[0]
+                row[[self._get_index_f(idx_l_in, idx_t) for idx_l_in in incoming_indices]] = 1
+
+                # Add outgoing flow coefficients (f_{l,t})
+                outgoing_indices = np.where(self.outgoing_mask[idx_n])[0]
+                row[[self._get_index_f(idx_l_out, idx_t) for idx_l_out in outgoing_indices]] = -1
+
+                # Add missed demand coefficients (md_{n,t})
+                idx_md_nt = self._get_index_md(idx_n, idx_t)
+                row[idx_md_nt] = 1
+
+                # Append row and RHS to the constraint matrix
+                eq_cm.append(row)
+                eq_rhs.append(self.pDemand[(n, t)])
+
+    def _get_generators_connected_to_node(self, node):
+        """Return a list of generators connected to the given node."""
+        return [g for g in self.G if self._generator_node_map[g] == node]
+
+    def _get_lines_starting_at_node(self, node):
+        """Return a list of lines starting at the given node."""
+        return [l for l in self.L if self._line_start_node_map[l] == node]
+
+    def _get_lines_ending_at_node(self, node):
+        """Return a list of lines ending at the given node."""
+        return [l for l in self.L if self._line_end_node_map[l] == node]
+    
+    def _create_empty_row(self,):
+        return np.zeros(len(self.G) * self.sample_duration + len(self.L) * self.sample_duration + len(self.N) * self.sample_duration + len(self.G))
+
+    def _get_index_p(self, idx_g, idx_t):
+        """Get the index of p_{g,t} in the flattened decision variable vector."""
+        return idx_g * self.sample_duration + idx_t
+
+    def _get_index_f(self, idx_l, idx_t):
+        """Get the index of f_{l,t} in the flattened decision variable vector."""
+        return self.index_f_offset + idx_l * self.sample_duration + idx_t
+
+    def _get_index_md(self, idx_n, idx_t):
+        """Get the index of md_{n,t} in the flattened decision variable vector."""
+        return self.index_md_offset + idx_n * self.sample_duration + idx_t
+
+    def _get_index_ui(self, idx_g):
+        """Get the index of ui_g in the flattened decision variable vector."""
+        return self.index_ui_offset + idx_g
+
+    def _split_X_in_sets(self, train=0.8, valid=0.1, test=0.1):
         # Ensure the split ratios sum to 1
         assert train + valid + test == 1.0
 
         # Total number of samples
-        B = X.size(0)
-
-        # Shuffle the indices if self.shuffle = True
-        if self.shuffle:
-            indices = torch.randperm(B)
-        else:
-            indices = torch.arange(B)
+        B = self.X.size(0)
+        indices = torch.arange(B)
 
         # Compute sizes for each set
         train_size = int(train * B)
         valid_size = int(valid * B)
 
         # Split the indices
-        train_indices = indices[:train_size]
-        valid_indices = indices[train_size:train_size+valid_size]
-        test_indices = indices[train_size+valid_size:]
-
-        # Split the data
-        trainX = X[train_indices]
-        validX = X[valid_indices]
-        testX = X[test_indices]
+        self._train_indices = indices[:train_size]
+        self._valid_indices = indices[train_size:train_size+valid_size]
+        self._test_indices = indices[train_size+valid_size:]
 
         # Convert time_ranges to a tensor or use list comprehension
         time_ranges_tensor = torch.tensor(self.time_ranges)
 
         # Split time ranges
-        self._train_time_ranges = time_ranges_tensor[train_indices].tolist()
-        self._val_time_ranges = time_ranges_tensor[valid_indices].tolist()
-        self._test_time_ranges = time_ranges_tensor[test_indices].tolist()
+        self.train_time_ranges = time_ranges_tensor[self.train_indices].tolist()
+        self.val_time_ranges = time_ranges_tensor[self.valid_indices].tolist()
+        self.test_time_ranges = time_ranges_tensor[self.test_indices].tolist()
 
         print(f"Size of train set: {train_size}")
         print(f"Size of val set: {valid_size}")
         print(f"Size of test set: {B - train_size - valid_size}")
-        
-        return trainX, validX, testX
-    
-    def _split_y(self, y):
-        assert(y.shape[1] == self.vGenProd_size+self.vLineFlow_size+self.vLossLoad_size+self.vGenInv_size)
-        vGenProd = y[:, :self.vGenProd_size]
-        vLineFlow = y[:, self.vGenProd_size:self.vGenProd_size+self.vLineFlow_size]
-        vLossLoad = y[:, self.vGenProd_size+self.vLineFlow_size:self.vGenProd_size+self.vLineFlow_size+self.vLossLoad_size]
-        vGenInv = y[:, self.vGenProd_size+self.vLineFlow_size+self.vLossLoad_size:]
-
-        vGenProd = vGenProd.reshape(y.shape[0], len(self.G), self.sample_duration) # Reshape to 2d array of size (batch_size, G, T)
-        vLineFlow = vLineFlow.reshape(y.shape[0], len(self.L), self.sample_duration)
-        vLossLoad = vLossLoad.reshape(y.shape[0], len(self.N), self.sample_duration)
-
-        return vGenProd, vLineFlow, vLossLoad, vGenInv
-    
-    def _split_x(self, X):
-        # Shape is equal to [B, N*T+G*T]
-        assert(X.shape[1] == (self.pDemand_tensor.shape[0]*self.sample_duration+self.pGenAva_tensor.shape[0]*self.sample_duration))
-        # Sizes
-        N = self.pDemand_tensor.shape[0]  # Number of nodes
-        G = self.pGenAva_tensor.shape[0]  # Number of generators
-        T = self.sample_duration          # Sample duration
-
-        # Slice and reshape
-        pDemand = X[:, :N * T].reshape(-1, N, T)  # Shape [B, N, T]
-        pGenAva = X[:, N * T:].reshape(-1, G, T)  # Shape [B, G, T]
-
-        # Return shapes equal to [B, N, T], [B, G, T]
-        return pDemand, pGenAva
-    
-    def ineq_dist(self, X, y):
-        resids = self.g(X, y)
-        return torch.clamp(resids, 0)
-
-    # 3.1a
-    # def obj_fn(self, y):
-    #     # Split the decision variables
-    #     vGenProd, _, vLossLoad, vGenInv = self._split_y(y)
-
-    #     # Investment cost (summed over generators)
-    #     inv_cost = torch.sum(self.pInvCost_tensor * self.pUnitCap_tensor * vGenInv, dim=1)
-
-    #     # Operational cost (summed over generators and nodes, weighted by time)
-    #     ope_cost = self.pWeight_tensor * (
-    #         torch.sum(self.pVarCost_tensor.view(-1, 1) * vGenProd, dim=(1, 2)) +
-    #         torch.sum(self.pVOLL_tensor.view(1, -1, 1) * vLossLoad, dim=(1, 2))
-    #     )
-
-    #     # Combine costs
-    #     return torch.sum(inv_cost + ope_cost)
-
-    #! Batched!
-    def obj_fn(self, y):
-        # Split the decision variables
-        vGenProd, _, vLossLoad, vGenInv = self._split_y(y)
-
-        # Investment cost (summed over generators)
-        inv_cost = torch.sum(self.pInvCost_tensor * self.pUnitCap_tensor * vGenInv, dim=1)  # Shape: [batch_size]
-
-        # Operational cost (summed over generators and nodes, weighted by time)
-        ope_cost = torch.sum(
-            self.pWeight_tensor.view(1, -1) * (  # Broadcast weights across batch dimension
-                torch.sum(self.pVarCost_tensor.view(1, -1, 1) * vGenProd, dim=2) +  # Sum over generator dim
-                torch.sum(self.pVOLL_tensor.view(1, -1, 1) * vLossLoad, dim=2)  # Sum over load dim
-            ), dim=1  # Sum across time dim
-        )  # Shape: [batch_size]
-
-        # Combine costs
-        total_cost = inv_cost + ope_cost  # Shape: [batch_size]
-        return total_cost
-    
-    # 3.1b
-    # Ensure production never exceeds capacity
-    def _e_max_prod(self, vGenProd, vGenInv):
-        ret = []
-        for idxg, g in enumerate(self.G):
-            for idxt, t in enumerate(self.T):
-                availability = self.pGenAva.get((*g, t), 1.0)  # Default availability to 1.0
-                # return vGenProd[g, t] <= availability * self.pUnitCap[g] * vGenInv[g]    
-                ret.append(vGenProd[:, idxg, idxt] - availability * self.pUnitCap[g] * vGenInv[:, idxg])
-        
-        return torch.tensor(ret, device=self.DEVICE)
-    
-    def _e_max_prod_tensor(self, vGenProd, vGenInv, pGenAva):
-        # pGenAva [B, G, T]
-        # pUnitCap [G]
-        max_cap = pGenAva * self.pUnitCap_tensor.view(1, len(self.G), 1)   # [B, G, T]
-        vGenInv_expanded = vGenInv.unsqueeze(-1)                            # [B, G, 1]
-        capacity_constraint = max_cap * vGenInv_expanded                    # [B, G, T]   
-        # return (vGenProd - capacity_constraint).flatten()                   # [B*G*T]
-        return (vGenProd - capacity_constraint).reshape(vGenProd.shape[0], -1) # [B, G*T]
-    
-    def _e_max_prod_tensor_scaled(self, vGenProd, vGenInv, pGenAva):
-        # pGenAva [B, G, T]
-        # pUnitCap [G]
-        max_cap = pGenAva * self.pUnitCap_tensor.view(1, len(self.G), 1)   # [B, G, T]
-        vGenInv_expanded = vGenInv.unsqueeze(-1)                            # [B, G, 1]
-        capacity_constraint = max_cap * vGenInv_expanded                    # [B, G, T]   
-        # return (vGenProd - capacity_constraint).flatten()                   # [B*G*T]
-        return ((vGenProd - capacity_constraint) / max_cap).reshape(vGenProd.shape[0], -1) # [B, G*T]
-    
-    
-    # 3.1d and 3.1e
-    def _e_lineflow(self, vLineFlow):
-        ret_lb = []
-        ret_ub = []
-        for idxl, l in enumerate(self.L):
-            for idxt, t in enumerate(self.T):
-                lb = -vLineFlow[:, idxl, idxt] - self.pImpCap[l]
-                ub = vLineFlow[:, idxl, idxt] - self.pExpCap[l]
-                ret_lb.append(lb)
-                ret_ub.append(ub)
-        
-        return torch.tensor(ret_lb), torch.tensor(ret_ub)
-
-    def _e_lineflow_tensor(self, vLineFlow):
-        # Ensure shapes:
-        # self.pImpCap_tensor: [L]
-        # self.pExpCap_tensor: [L]
-        # vLineFlow: [B, L, T]
-
-        # Expand capacities for broadcasting
-        pImpCap_tensor = self.pImpCap_tensor.unsqueeze(0).unsqueeze(-1)  # [1, L, 1]
-        pExpCap_tensor = self.pExpCap_tensor.unsqueeze(0).unsqueeze(-1)  # [1, L, 1]
-
-        # Compute lower and upper bounds
-        ret_lb = -vLineFlow - pImpCap_tensor  # [B, L, T]
-        ret_ub = vLineFlow - pExpCap_tensor  # [B, L, T]
-
-        # Return tensors directly
-        return ret_lb.reshape(vLineFlow.shape[0], -1), ret_ub.reshape(vLineFlow.shape[0], -1) # [B, L*T], [B, L*T]
-    
-    def _e_lineflow_tensor_scaled(self, vLineFlow):
-        # Ensure shapes:
-        # self.pImpCap_tensor: [L]
-        # self.pExpCap_tensor: [L]
-        # vLineFlow: [B, L, T]
-
-        # Expand capacities for broadcasting
-        pImpCap_tensor = self.pImpCap_tensor.unsqueeze(0).unsqueeze(-1)  # [1, L, 1]
-        pExpCap_tensor = self.pExpCap_tensor.unsqueeze(0).unsqueeze(-1)  # [1, L, 1]
-
-        # Compute lower and upper bounds
-        #! Scale by the constraint parameter.
-        ret_lb = (-vLineFlow - pImpCap_tensor) / pImpCap_tensor  # [B, L, T]
-        ret_ub = (vLineFlow - pExpCap_tensor) / pExpCap_tensor  # [B, L, T]
-
-        # Return tensors directly
-        return ret_lb.reshape(vLineFlow.shape[0], -1), ret_ub.reshape(vLineFlow.shape[0], -1) # [B, L*T], [B, L*T]
-
-    # 3.1g
-    def _e_ramping_up(self, vGenProd, vGenInv):
-        ret = []
-        for idxg, g in enumerate(self.G):
-            for idxt, t in enumerate(self.T[1:]):
-                ret.append(-1*(vGenProd[:, idxg, idxt+1] - vGenProd[:, idxg, idxt]) - self.pRamping * self.pUnitCap[g] * vGenInv[:, idxg])
-        return torch.tensor(ret)
-
-    def _e_ramping_up_tensor(self, vGenProd, vGenInv):
-        # vGenProd [B, G, T] [1, 2, 4]
-        # vGenInv [B, G] [1, 2]
-        # self.pRamping_tensor = [] (scalar)
-        # self.pUnitCap_tensor = [G] [2]
-
-        # p_gt - p_gt-1 <= R * UCAP_g * ui_g
-        # p_gt - p_gt-1 - R * UCAP_g * ui_g <= 0
-
-        production_diff = vGenProd[:, :, 1:] - vGenProd[:, :, :-1] # [B, G, T-1] [1, 2, 3]
-        ramping_allowed = self.pRamping_tensor * self.pUnitCap_tensor.unsqueeze(0) * vGenInv # [B, G]
-        ramping_allowed = ramping_allowed.unsqueeze(-1).expand(-1, -1, production_diff.shape[2]) # [B, G, T-1]
-        ret = production_diff - ramping_allowed # [B, G, T-1]
-        flattened = ret.reshape(vGenProd.shape[0], -1) # [B, G * (T-1)]
-
-        return flattened
-    
-    def _e_ramping_up_tensor_scaled(self, vGenProd, vGenInv):
-        # vGenProd [B, G, T] [1, 2, 4]
-        # vGenInv [B, G] [1, 2]
-        # self.pRamping_tensor = [] (scalar)
-        # self.pUnitCap_tensor = [G] [2]
-
-        # p_gt - p_gt-1 <= R * UCAP_g * ui_g
-        # p_gt - p_gt-1 - R * UCAP_g * ui_g <= 0
-
-        production_diff = vGenProd[:, :, 1:] - vGenProd[:, :, :-1] # [B, G, T-1] [1, 2, 3]
-        ramping_allowed = self.pRamping_tensor * self.pUnitCap_tensor.unsqueeze(0) * vGenInv # [B, G]
-        ramping_allowed = ramping_allowed.unsqueeze(-1).expand(-1, -1, production_diff.shape[2]) # [B, G, T-1]
-        ret = production_diff - ramping_allowed # [B, G, T-1]
-        ret = ret / (self.pRamping_tensor * self.pUnitCap_tensor.unsqueeze(0).unsqueeze(-1).expand(-1, -1, production_diff.shape[2]))
-        flattened = ret.reshape(vGenProd.shape[0], -1) # [B, G * (T-1)]
-
-        return flattened
-
-    # 3.1f
-    def _e_ramping_down(self, vGenProd, vGenInv):
-        ret = []
-        for idxg, g in enumerate(self.G):
-            for idxt, t in enumerate(self.T[1:]):
-                ret.append(vGenProd[:, idxg, idxt+1] - vGenProd[:, idxg, idxt] - self.pRamping * self.pUnitCap[g] * vGenInv[:, idxg])
-        return torch.tensor(ret)
-    
-    def _e_ramping_down_tensor(self, vGenProd, vGenInv):
-        # vGenProd [B, G, T]
-        # vGenInv [B, G]
-        # self.pRamping_tensor = [] (scalar)
-        # self.pUnitCap_tensor = [G]
-
-        # p_{gt} - p_{g,t-1} >= -R * UCAP_g * ui_g
-        # -(p_{gt} - p_{g,t-1}) <= R * UCAP_g * ui_g
-        # p_{g, t-1} - p_{gt} - R * UCAP_g * ui_g <= 0
-
-        # Production =  [0, T-1] - [1, T]
-        production_diff = vGenProd[:, :, :-1] - vGenProd[:, :, 1:] # [B, G, T-1]
-        ramping_allowed = self.pRamping_tensor * self.pUnitCap_tensor.unsqueeze(0) * vGenInv # [B, G]
-        ramping_allowed = ramping_allowed.unsqueeze(-1).expand(-1, -1, production_diff.shape[2]) # [B, G, T-1]
-        ret = production_diff - ramping_allowed # [B, G, T-1]
-        flattened = ret.reshape(vGenProd.shape[0], -1) # [B, G * (T-1)]
-
-        return flattened
-    
-    def _e_ramping_down_tensor_scaled(self, vGenProd, vGenInv):
-        # vGenProd [B, G, T]
-        # vGenInv [B, G]
-        # self.pRamping_tensor = [] (scalar)
-        # self.pUnitCap_tensor = [G]
-
-        # p_{gt} - p_{g,t-1} >= -R * UCAP_g * ui_g
-        # -(p_{gt} - p_{g,t-1}) <= R * UCAP_g * ui_g
-        # p_{g, t-1} - p_{gt} - R * UCAP_g * ui_g <= 0
-
-        # Production =  [0, T-1] - [1, T]
-        production_diff = vGenProd[:, :, :-1] - vGenProd[:, :, 1:] # [B, G, T-1]
-        ramping_allowed = self.pRamping_tensor * self.pUnitCap_tensor.unsqueeze(0) * vGenInv # [B, G]
-        ramping_allowed = ramping_allowed.unsqueeze(-1).expand(-1, -1, production_diff.shape[2]) # [B, G, T-1]
-        ret = production_diff - ramping_allowed # [B, G, T-1]
-        ret = ret / (self.pRamping_tensor * self.pUnitCap_tensor.unsqueeze(0).unsqueeze(-1).expand(-1, -1, production_diff.shape[2]))
-        flattened = ret.reshape(vGenProd.shape[0], -1) # [B, G * (T-1)]
-
-        return flattened
-            
-    # 3.1h
-    def _e_gen_prod_positive(self, vGenProd):
-        ret = []
-        for idxg, g in enumerate(self.G):
-            for idxt, t in enumerate(self.T):
-                ret.append(-vGenProd[:, idxg, idxt])
-        return torch.tensor(ret)
-
-    def _e_gen_prod_positive_tensor(self, vGenProd):
-        # vGenProd [B, G, T] [1, 2, 4]
-        return -1*vGenProd.reshape(vGenProd.shape[0], -1)
-    
-    # 3.1i
-    def _e_missed_demand_positive(self, vLossLoad):
-        ret = []
-        for idxn, n in enumerate(self.N):
-            for idxt, t in enumerate(self.T):
-                ret.append(-vLossLoad[:, idxn, idxt])
-        return torch.tensor(ret)
-    
-    def _e_missed_demand_positive_tensor(self, vLossLoad):
-        # vLossLoad [B, N, T] [1, 2, 4]
-        return -1*vLossLoad.reshape(vLossLoad.shape[0], -1)
-    
-
-    # 3.1j
-    def _e_missed_demand_leq_demand(self, vLossLoad):
-        ret = []
-        for idxn, n in enumerate(self.N):
-            for idxt, t in enumerate(self.T):
-                ret.append(vLossLoad[:, idxn, idxt] - self.pDemand[(n, t)])
-        return torch.tensor(ret)
-
-    def _e_missed_demand_leq_demand_tensor(self, vLossLoad, pDemand):
-        # vLossLoad [B, N, T] [1, 2, 4]
-        # self.pDemand_tensor [N, T]
-        # pDemand [B, N, T]
-        return (vLossLoad - pDemand).reshape(vLossLoad.shape[0], -1)
-
-    def _e_missed_demand_leq_demand_tensor_scaled(self, vLossLoad, pDemand):
-        # vLossLoad [B, N, T] [1, 2, 4]
-        # self.pDemand_tensor [N, T]
-        # pDemand [B, N, T]
-        return ((vLossLoad - pDemand) / pDemand).reshape(vLossLoad.shape[0], -1)
-    
-    # 3.1k
-    def _e_num_power_generation_units_positive(self, vGenInv):
-        ret = []
-        for idxg, g in enumerate(self.G):
-            ret.append(-vGenInv[:, idxg])
-        return torch.tensor(ret)
-    
-    def _e_num_power_generation_units_positive_tensor(self, vGenInv):
-        return -1*vGenInv.reshape(vGenInv.shape[0], -1)
-
-
-    def g(self, X, y):
-        """Assume y contains [*vGenProd, *vLineFlow, *vLossLoad, *vGenInv]
-
-        Args:
-            y (_type_): 
-
-        Returns [eMaxProd, eLineFlow, eRampingDown, eRampingUp, eGenProdPositive, eMissedDemandPositive, eMissedDemandLeqDemand eNumPowerGenerationUnitsPositive]
-        """
-        vGenProd, vLineFlow, vLossLoad, vGenInv = self._split_y(y)
-
-        # pDemand [B, N, T]
-        # pGenAva [B, G, T]
-        pDemand, pGenAva = self._split_x(X)
-
-
-        # 3.1b
-        # b = self._e_max_prod(vGenProd, vGenInv)
-        b = self._e_max_prod_tensor(vGenProd, vGenInv, pGenAva)
-        
-
-        # 3.1d, 3.1e
-        # d, e = self._e_lineflow(vLineFlow)
-        d, e = self._e_lineflow_tensor(vLineFlow)
-        # d, e = self._e_lineflow_tensor_scaled(vLineFlow)
-
-        # 3.1f
-        # f = self._e_ramping_down(vGenProd, vGenInv)
-        f = self._e_ramping_down_tensor(vGenProd, vGenInv)
-        # f = self._e_ramping_down_tensor_scaled(vGenProd, vGenInv)
-
-        # 3.1g
-        # g = self._e_ramping_up(vGenProd, vGenInv)
-        g = self._e_ramping_up_tensor(vGenProd, vGenInv)
-        # g = self._e_ramping_up_tensor_scaled(vGenProd, vGenInv)
-
-        # 3.1h
-        # h = self._e_gen_prod_positive(vGenProd)
-        h = self._e_gen_prod_positive_tensor(vGenProd)
-
-        # 3.1i
-        # i = self._e_missed_demand_positive(vLossLoad)
-        i = self._e_missed_demand_positive_tensor(vLossLoad)
-
-        # 3.1j
-        # j = self._e_missed_demand_leq_demand(vLossLoad)
-        j = self._e_missed_demand_leq_demand_tensor(vLossLoad, pDemand)
-        # j = self._e_missed_demand_leq_demand_tensor_scaled(vLossLoad, pDemand)
-
-        # 3.1k
-        # k = self._e_num_power_generation_units_positive(vGenInv)
-        k = self._e_num_power_generation_units_positive_tensor(vGenInv)
-
-        g_x_y = torch.cat((b, d, e, f, g, h, i, j, k), dim=1)
-
-        return g_x_y
-    
-    # 3.1c
-    def _e_nodebal(self, vGenProd, vLineFlow, vLossLoad):
-        ret = []
-        for idxn, n in enumerate(self.N):
-            for idxt, t in enumerate(self.T):
-                # print(self.pDemand[n, t])
-                gen_sum = sum(vGenProd[:, idxg, idxt] for idxg, g in enumerate(self.G) if g[0] == n)
-                # print(gen_sum)
-                inflow_sum = sum(vLineFlow[:, idxl, idxt] for idxl, l in enumerate(self.L) if l[1] == n)
-                # print(inflow_sum)
-                outflow_sum = sum(vLineFlow[:, idxl, idxt] for idxl, l in enumerate(self.L) if l[0] == n)
-                # print(outflow_sum)
-                # print(vLossLoad[:, idxn, idxt])
-                ret.append(self.pDemand[n, t] -
-                                (gen_sum +
-                                inflow_sum - 
-                                outflow_sum +
-                                vLossLoad[:, idxn, idxt]
-                                ))
-        
-        return torch.tensor(ret)
-
-    def _e_nodebal_tensor(self, vGenProd, vLineFlow, vLossLoad, pDemand):
-        # ! Check
-        # vGenProd [B, G, T]
-        # vLineFlow [B, L, T]
-        # vLossLoad [B, N, T]
-        # self.pDemand_tensor [N, T]
-        # pDemand [B, N, T]
-
-        # D_nt - sum(power supplied to n by generators) + sum(power entering node n from other nodes) + sum(power leaving node n to other nodes)
-        # Compute generation contribution for each node
-        # Convert pDemand to tensor and add batch dimension
-        vGenProd_expanded = vGenProd.unsqueeze(1)  # [B, 1, G, T]
-        vLineFlow_expanded = vLineFlow.unsqueeze(1) # [B, 1, L, T]
-        gen_mask = self.gen_mask.unsqueeze(0) # [1, N, G, T]
-        inflow_mask = self.inflow_mask.unsqueeze(0) # [1, N, L, T]
-        outflow_mask = self.outflow_mask.unsqueeze(0) # [1, N, L, T]
-        # pDemand_tensor = self.pDemand_tensor.unsqueeze(0) # [1, N, T]
-
-        # self.gen_mask [N, G, T]
-        # self.inflow_mask [N, L, T]
-        # self.outflow_mask [N, L, T]
-        # Compute generation contribution for each node
-        gen_sum = (gen_mask * vGenProd_expanded).sum(dim=2)  # [B, N, T]
-
-        # Compute inflows and outflows for each node
-        inflow_sum = (inflow_mask * vLineFlow_expanded).sum(dim=2)  # [B, N, T]
-        outflow_sum = (outflow_mask * vLineFlow_expanded).sum(dim=2)  # [B, N, T]
-
-        # print(pDemand_tensor)
-        # print(gen_sum)
-        # print(inflow_sum)
-        # print(vLossLoad)
-        # Node balance equation
-        node_balance = (
-            pDemand                                 # [B, N, T]
-            - (gen_sum                              # [B, N, T]
-            + inflow_sum                            # [B, N, T]
-            - outflow_sum                           # [B, N, T]
-            + vLossLoad)                            # [B, N, T]
-        )
-
-        return node_balance.reshape(vGenProd.shape[0], -1)  # Shape: [B, N * T]
-    
-        
-    def _generate_nodebal_masks(self):
-        # Create generator-to-node mapping mask
-        self.gen_mask = torch.tensor(
-            [[1 if g[0] == n else 0 for g in self.G] for n in self.N], 
-            device=self.DEVICE, dtype=self.DTYPE
-        ).unsqueeze(-1).expand(-1, -1, self.sample_duration)  # Shape: [N, G, T]
-
-        # Create line-to-node mapping masks for inflows and outflows
-        self.inflow_mask = torch.tensor(
-            [[1 if l[1] == n else 0 for l in self.L] for n in self.N], 
-            device=self.DEVICE, dtype=self.DTYPE
-        ).unsqueeze(-1).expand(-1, -1, self.sample_duration)  # Shape: [N, L, T]
-
-        self.outflow_mask = torch.tensor(
-            [[1 if l[0] == n else 0 for l in self.L] for n in self.N], 
-            device=self.DEVICE, dtype=self.DTYPE
-        ).unsqueeze(-1).expand(-1, -1, self.sample_duration)  # Shape: [N, L, T]
-
-    def h(self, X, y):
-        """Assume y contains [*vGenProd, *vLineFlow, *vLossLoad, *vGenInv]
-
-        Args:
-            y (_type_): _description_
-        """
-        vGenProd, vLineFlow, vLossLoad, _ = self._split_y(y)
-        pDemand, _ = self._split_x(X)
-
-        # 3.1c
-        # h_x_y = self._e_nodebal(vGenProd, vLineFlow, vLossLoad)
-        h_x_y = self._e_nodebal_tensor(vGenProd, vLineFlow, vLossLoad, pDemand)
-
-        return h_x_y

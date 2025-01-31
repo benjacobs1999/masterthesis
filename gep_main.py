@@ -4,6 +4,7 @@ from gep_config_parser import *
 from data_wrangling import dataframe_to_dict
 import pyomo.environ as pyo
 import torch
+import json
 
 DEVICE = 'cpu'
 
@@ -13,8 +14,26 @@ VISUALIZATION_FILE_NAME = "visualization.toml"
 HIGHS  = "HiGHS"
 GUROBI = "Gurobi"
 
+SCALE = True
+
 # SAMPLE_DURATION = 12 # 12 hours
-SAMPLE_DURATION = 12 # 12 hours
+SAMPLE_DURATION = 24 # 1 day
+
+SCALE_FACTORS = {
+    "pDemand": 1/1000,  # MW -> GW
+    "pGenAva": 1,       # Don't scale
+    "pVOLL": 1/1000,         # kEUR/MWh -> mEUR/GWh
+    "pWeight": 1,       # Don't scale
+    "pRamping": 1,      # Don't scale
+    "pInvCost": 1/1000,      # kEUR/MW -> mEUR/GW
+    "pVarCost": 1/1000,      # kEUR/MWh -> mEUR/GWh
+    "pUnitCap": 1/1000, # MW -> GW
+    "pExpCap": 1/1000,  # MW -> GW
+    "pImpCap": 1/1000,  # MW -> GW
+}
+
+def scale_dict(data_dict, scale_factor):
+    return {key: value * scale_factor for key, value in data_dict.items()}
 
 ## Step 0: Activate environment - ensure consistency accross computers
 # print("Reading the data")
@@ -40,22 +59,20 @@ elif optimizer_name == GUROBI:
 else:
     raise ValueError(f"{optimizer_name}: Not implemented")
 
-def prep_data(inputs):
+def prep_data(inputs, N=None, G=None, L=None):
         print("Wrangling the input data")
 
         # Extract sets
         T = inputs["times"] # [1, 2, 3, ... 8761] ---> 8761
-        G = inputs["generators"] # [('Country1', 'EnergySource1'), ...] ---> 107
-        L = inputs["transmission_lines"] # [('Country1', 'Country2'), ...] ---> 44
-        N = inputs["nodes"] # ['Country1', 'Country2', ...] ---> 20
 
-        ### SET UP CUSTOM CONFIG ###
-        # N = ['BEL', 'FRA', 'GER', 'NED'] # 4 nodes
-        # N = ['BEL', 'GER', 'NED'] # 3 nodes
-        # G = [('BEL', 'SunPV'), ('FRA', 'SunPV'), ('GER', 'SunPV'), ('NED', 'SunPV')] # 4 generators
-        # G = [('BEL', 'SunPV'), ('GER', 'SunPV'), ('NED', 'SunPV')] # 3 generators
-        # L = [('BEL', 'FRA'), ('BEL', 'GER'), ('BEL', 'NED'), ('GER', 'FRA'), ('GER', 'NED')] # 5 lines
-        # L = [('BEL', 'GER'), ('BEL', 'NED'), ('GER', 'NED')] # 3 lines
+        if not (N or G or L):
+            G = inputs["generators"] # [('Country1', 'EnergySource1'), ...] ---> 107
+            L = inputs["transmission_lines"] # [('Country1', 'Country2'), ...] ---> 44
+            N = inputs["nodes"] # ['Country1', 'Country2', ...] ---> 20
+        else:
+            # Convert to tuples
+            G = [tuple(pair) for pair in G]
+            L = [tuple(pair) for pair in L]
 
 
         # Extract time series data
@@ -113,15 +130,26 @@ def prep_data(inputs):
         pExpCap = dict(sorted(pExpCap.items()))
         pImpCap = dict(sorted(pImpCap.items()))
 
+        if SCALE:
+            pDemand = scale_dict(pDemand, SCALE_FACTORS["pDemand"])
+            pGenAva = scale_dict(pGenAva, SCALE_FACTORS["pGenAva"])
+            pVOLL *= SCALE_FACTORS["pVOLL"]
+            pWeight *= SCALE_FACTORS["pWeight"]
+            pRamping *= SCALE_FACTORS["pRamping"]
+            pInvCost = scale_dict(pInvCost, SCALE_FACTORS["pInvCost"])
+            pVarCost = scale_dict(pVarCost, SCALE_FACTORS["pVarCost"])
+            pUnitCap = scale_dict(pUnitCap, SCALE_FACTORS["pUnitCap"])
+            pExpCap = scale_dict(pExpCap, SCALE_FACTORS["pExpCap"])
+            pImpCap = scale_dict(pImpCap, SCALE_FACTORS["pImpCap"])
+
+
         return T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap
 
-def run_model(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap):
-    
-    if outputs_config["terminal"]["input_plots"]:
-        # print("Input data statistics")
-        # visualization_data = get_visualization_data(VISUALIZATION_FILE_NAME)
-        # print_input_statistics(inputs, visualization_data)
-        pass
+def run_model(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, constant_gen_inv=False):
+
+    # ! Keep GenInv constant, instead of a decision variable (change to operational problem):
+    if constant_gen_inv:
+        pGenInv = {('BEL', 'SunPV'): 4130.05009001755, ('GER', 'SunPV'): 11232.550865341998}
     
     # Extract optimizer attributes
     attributes = data["optimizer_config"][optimizer_name]
@@ -132,9 +160,12 @@ def run_model(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pI
     # Check the crossover setting
     if inputs["crossover"] != "gurobi":
         attributes["Crossover"] = 0
+        attributes["FeasibilityTol"] = 1e-9
 
     # Initialize the model with the optimizer and attributes
     model, solver = initialize_model(optimizer, attributes)
+    model.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)    # Add dual problem.
+    model.rc = pyo.Suffix(direction=pyo.Suffix.IMPORT)    # Add reduced costs.
 
     print("Populating the model")
 
@@ -148,10 +179,11 @@ def run_model(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pI
     model.vOpeCost = pyo.Var(within=pyo.NonNegativeReals, initialize=0)
 
     # Generator investment variables
-    if inputs["relaxed"] == "true":
-        model.vGenInv = pyo.Var(G, within=pyo.NonNegativeReals, initialize=0)
-    else:
-        model.vGenInv = pyo.Var(G, within=pyo.Integers, bounds=(0, None), initialize=0)
+    if not constant_gen_inv:
+        if inputs["relaxed"] == "true":
+            model.vGenInv = pyo.Var(G, within=pyo.NonNegativeReals, initialize=0)
+        else:
+            model.vGenInv = pyo.Var(G, within=pyo.Integers, bounds=(0, None), initialize=0)
 
     # Generator production variables (non-negative)
     model.vGenProd = pyo.Var(G, T, within=pyo.NonNegativeReals, initialize=0)
@@ -182,10 +214,16 @@ def run_model(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pI
     # Investment costs
     # Sum_{g in G} IC_g * UCAP_g * ui_g
     # Investment cost (€/MW) * capacity of a unit (MW) * nr of units = Investment cost at g (€)
-    def eInvCost_rule(model):
-        return model.vInvCost == sum(
-            pInvCost[g] * pUnitCap[g] * model.vGenInv[g] for g in G
-        )
+    if constant_gen_inv:
+        def eInvCost_rule(model):
+            return model.vInvCost == sum(
+                pInvCost[g] * pUnitCap[g] * pGenInv[g] for g in G
+            )
+    else:
+        def eInvCost_rule(model):
+            return model.vInvCost == sum(
+                pInvCost[g] * pUnitCap[g] * model.vGenInv[g] for g in G
+            )
     model.eInvCost = pyo.Constraint(rule=eInvCost_rule)
 
     # Operating costs
@@ -214,43 +252,303 @@ def run_model(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pI
 
     # (3.1b)
     # Ensure production never exceeds capacity
-    def eMaxProd_rule(model, g0, g1, t):
-        availability = pGenAva.get((g0, g1, t), 1.0)  # Default availability to 1.0
-        return model.vGenProd[(g0, g1), t] <= availability * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
-    
+    if constant_gen_inv:
+        def eMaxProd_rule(model, g0, g1, t):
+            availability = pGenAva.get((g0, g1, t), 1.0)  # Default availability to 1.0
+            return model.vGenProd[(g0, g1), t] <= availability * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]
+    else:
+        def eMaxProd_rule(model, g0, g1, t):
+            availability = pGenAva.get((g0, g1, t), 1.0)  # Default availability to 1.0
+            return model.vGenProd[(g0, g1), t] <= availability * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
+        
     model.eMaxProd = pyo.Constraint(G, T, rule=eMaxProd_rule)
 
     # Ramping constraints
     # No large changes in production between timesteps
-    if inputs["ramping"] == "true":
+    if constant_gen_inv:
+        if inputs["ramping"] == "true":
         # Ramping up (3.1g)
-        def eRampingUp_rule(model, g0, g1, t):
-            if t == T[0]:  # Skip the first time step for ramping constraints
-                return pyo.Constraint.Skip
-            return (
-                model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
-                <= pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
+            def eRampingUp_rule(model, g0, g1, t):
+                if t == T[0]:  # Skip the first time step for ramping constraints
+                    return pyo.Constraint.Skip
+                return (
+                    model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
+                    <= pRamping * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]
+                )
+            model.eRampingUp = pyo.Constraint(G, T, rule=eRampingUp_rule)
+
+            # Ramping down (3.1f)
+            def eRampingDown_rule(model, g0, g1, t):
+                if t == T[0]:  # Skip the first time step for ramping constraints
+                    return pyo.Constraint.Skip
+                return (
+                    -pRamping * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]
+                    <= model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
+                )
+            model.eRampingDown = pyo.Constraint(G, T, rule=eRampingDown_rule)
+    else:
+        if inputs["ramping"] == "true":
+            # Ramping up (3.1g)
+            def eRampingUp_rule(model, g0, g1, t):
+                if t == T[0]:  # Skip the first time step for ramping constraints
+                    return pyo.Constraint.Skip
+                return (
+                    model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
+                    <= pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
+                )
+            model.eRampingUp = pyo.Constraint(G, T, rule=eRampingUp_rule)
+
+            # Ramping down (3.1f)
+            def eRampingDown_rule(model, g0, g1, t):
+                if t == T[0]:  # Skip the first time step for ramping constraints
+                    return pyo.Constraint.Skip
+                return (
+                    -pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
+                    <= model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
+                )
+            model.eRampingDown = pyo.Constraint(G, T, rule=eRampingDown_rule)
+
+    ## Step 4: Solve
+    print("Solving the optimization problem")
+    results = solver.solve(model, tee=False)
+    time_taken = solver._solver_model.Runtime
+
+    print(f"Objective Value: {model.obj()}")
+    return model, solver, time_taken
+
+def get_variable_values_as_list(var):
+    # Check if the variable is indexed
+    if var.is_indexed():
+        return [var[idx].value for idx in var]
+    else:
+        # For scalar variables
+        return [var.value]
+
+def run_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, constant_gen_inv=False):
+    """This model is a slower implementation, which does not use any bounds (domains), but is instead modeled using only constraints, so that it is in line with the GEP problem for PDL, 
+    where all of the domains are processed as constraints, and the inequality constraints are rewritten to the form <= 0, and equality constraints to the form = 0.
+    We do this so that we can directly compare the solver output to PDL.
+    """
+
+    # ! Keep GenInv constant, instead of a decision variable (change to operational problem):
+    if constant_gen_inv:
+        # pGenInv = {('BEL', 'Gas'): 26.13, ('GER', 'Gas'): 129.78} # 3 generators
+        pGenInv = {('BEL', 'SunPV'): 4130.05009001755, ('GER', 'SunPV'): 11232.550865341998}
+    
+    # Extract optimizer attributes
+    attributes = data["optimizer_config"][optimizer_name]
+
+    # Add the log file attribute
+    attributes["LogFile"] = inputs["output_log"]
+
+    # Check the crossover setting
+    if inputs["crossover"] != "gurobi":
+        attributes["Crossover"] = 1
+        attributes["FeasibilityTol"] = 1e-9
+
+    # Initialize the model with the optimizer and attributes
+    model, solver = initialize_model(optimizer, attributes)
+    model.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)    # Add dual problem.
+    model.rc = pyo.Suffix(direction=pyo.Suffix.IMPORT)    # Add reduced costs.
+
+    print("Populating the model")
+
+    # Create variables
+    print("Adding model variables")
+
+    # Investment cost variable (non-negative)
+    model.vInvCost = pyo.Var(within=pyo.NonNegativeReals, initialize=0)
+
+    # Operational cost variable (non-negative)
+    model.vOpeCost = pyo.Var(within=pyo.NonNegativeReals, initialize=0)
+
+    if not constant_gen_inv:
+        # Generator investment variables
+        if inputs["relaxed"] == "true":
+            # model.vGenInv = pyo.Var(G, within=pyo.NonNegativeReals, initialize=0)
+            model.vGenInv = pyo.Var(G, initialize=0) #! Remove the domain.
+        else:
+            model.vGenInv = pyo.Var(G, within=pyo.Integers, bounds=(0, None), initialize=0)
+
+    # Generator production variables (non-negative)
+    # model.vGenProd = pyo.Var(G, T, within=pyo.NonNegativeReals, initialize=0)
+    model.vGenProd = pyo.Var(G, T, initialize=0) #! Remove the domain
+
+    # Ensure lineflow is within max import and export capacities
+    # 3.1d & 3.1e
+    # Since L has a tuple of two countries as index, pyomo unpacks it
+    def lineFlowBounds(model, l0, l1, t):
+        return (-pImpCap[(l0, l1)], pExpCap[(l0, l1)])
+
+    # Transmission line flow variables with bounds    
+    # model.vLineFlow = pyo.Var(L, T, bounds=lineFlowBounds)
+    model.vLineFlow = pyo.Var(L, T) #! Remove the bounds
+
+    # Loss of load variables with bounds based on demand
+    model.vLossLoad = pyo.Var(
+        N, T, 
+        initialize=0, 
+        # bounds=lambda model, n, t: (0, pDemand[(n, t)]) #! Remove the bounds
+    )
+
+    # Formulate objective
+    print("Formulating the objective")
+    model.obj = pyo.Objective(expr=model.vInvCost + model.vOpeCost, sense=pyo.minimize)
+
+    # Constraints
+    print("Adding model constraints")
+
+    # Investment costs
+    # Sum_{g in G} IC_g * UCAP_g * ui_g
+    # Investment cost (€/MW) * capacity of a unit (MW) * nr of units = Investment cost at g (€)
+    if constant_gen_inv:
+        def eInvCost_rule(model):
+            return model.vInvCost == sum(
+                pInvCost[g] * pUnitCap[g] * pGenInv[g] for g in G
             )
-        model.eRampingUp = pyo.Constraint(G, T, rule=eRampingUp_rule)
-
-        # Ramping down (3.1f)
-        def eRampingDown_rule(model, g0, g1, t):
-            if t == T[0]:  # Skip the first time step for ramping constraints
-                return pyo.Constraint.Skip
-            return (
-                -pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
-                <= model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
+    else:
+        def eInvCost_rule(model):
+            return model.vInvCost == sum(
+                pInvCost[g] * pUnitCap[g] * model.vGenInv[g] for g in G
             )
-        model.eRampingDown = pyo.Constraint(G, T, rule=eRampingDown_rule)
+    model.eInvCost = pyo.Constraint(rule=eInvCost_rule)
 
-        ## Step 4: Solve
-        print("Solving the optimization problem")
-        # results = solver.solve(model, tee=True)
-        results = solver.solve(model, tee=False)
-        time_taken = solver._solver_model.Runtime
+    # Operating costs
+    # WOP * (Sum_{g in G, t in T} (PC_g * p_{g, t}) + Sum_{n in N, t in T} (MDC * md_{n,t}))
+    # Period weight * (variable production cost (€/MWh) * energy generation (MW) + 
+    #                  cost of missed demand (€/MW) * missed demand (€/MW))
+    def eOpeCost_rule(model):
+        return model.vOpeCost == pWeight * (
+            sum(pVarCost[g] * model.vGenProd[g, t] for g in G for t in T)
+            + sum(pVOLL * model.vLossLoad[n, t] for n in N for t in T)
+        )
+    model.eOpeCost = pyo.Constraint(rule=eOpeCost_rule)
 
-        print(f"Objective Value: {model.obj()}")
-        return model, solver, time_taken
+    # (3.1b)
+    # Ensure production never exceeds capacity
+    if constant_gen_inv:
+        def eMaxProd_rule(model, g0, g1, t):
+            availability = pGenAva.get((g0, g1, t), 1.0)  # Default availability to 1.0
+            # return model.vGenProd[(g0, g1), t] <= availability * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] #! Rewrite to <= 0
+            return model.vGenProd[(g0, g1), t] - (availability * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]) <= 0
+    else:
+        def eMaxProd_rule(model, g0, g1, t):
+            availability = pGenAva.get((g0, g1, t), 1.0)  # Default availability to 1.0
+            # return model.vGenProd[(g0, g1), t] <= availability * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] #! Rewrite to <= 0
+            return model.vGenProd[(g0, g1), t] - (availability * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) <= 0
+        
+    model.eMaxProd = pyo.Constraint(G, T, rule=eMaxProd_rule)
+
+
+    # (3.1c)
+    # Ensure energy balance at each node
+    # Demand = generation + transmissionB->A - transmissionA-B + missed_demand
+    def eNodeBal_rule(model, n, t):
+        return (
+            # sum(model.vGenProd[g, t] for g in G if g[0] == n)
+            # + sum(model.vLineFlow[l, t] for l in L if l[1] == n)
+            # - sum(model.vLineFlow[l, t] for l in L if l[0] == n)
+            # + model.vLossLoad[n, t]
+            # == pDemand[(n, t)] #! Rewrite to form  = 0
+            sum(model.vGenProd[g, t] for g in G if g[0] == n)
+            + sum(model.vLineFlow[l, t] for l in L if l[1] == n)
+            - sum(model.vLineFlow[l, t] for l in L if l[0] == n)
+            + model.vLossLoad[n, t]
+            - pDemand[(n, t)]
+            == 0
+        )
+    model.eNodeBal = pyo.Constraint(N, T, rule=eNodeBal_rule)
+
+    # (3.1d)
+    # Ensure lineflow lower bound
+    def eLineFlowLB_rule(model, l0, l1, t):
+        return -1 * pImpCap[(l0, l1)] - model.vLineFlow[(l0, l1), t] <= 0
+
+    model.eLineFlowLB = pyo.Constraint(L, T, rule=eLineFlowLB_rule)
+
+    # (3.1e)
+    # Ensure lineflow upper bound
+    def eLineFlowUB_rule(model, l0, l1, t):
+        return model.vLineFlow[(l0, l1), t] - pExpCap[(l0, l1)] <= 0
+
+    model.eLineFlowUB = pyo.Constraint(L, T, rule=eLineFlowUB_rule)
+
+    # Ramping constraints
+    # No large changes in production between timesteps
+    if constant_gen_inv:
+        if inputs["ramping"] == "true":
+            # Ramping up (3.1g)
+            def eRampingUp_rule(model, g0, g1, t):
+                if t == T[0]:  # Skip the first time step for ramping constraints
+                    return pyo.Constraint.Skip
+                return (
+                    # model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
+                    # <= pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] # ! Transform to <= 0
+                    (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) - (pRamping * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]) <= 0
+                )
+            model.eRampingUp = pyo.Constraint(G, T, rule=eRampingUp_rule)
+
+            # Ramping down (3.1f)
+            def eRampingDown_rule(model, g0, g1, t):
+                if t == T[0]:  # Skip the first time step for ramping constraints
+                    return pyo.Constraint.Skip
+                return (
+                    # -pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
+                    # <= model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]] # ! Transform to <= 0
+                    (-pRamping * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]) - (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) <= 0
+                )
+            model.eRampingDown = pyo.Constraint(G, T, rule=eRampingDown_rule)
+    else:
+        if inputs["ramping"] == "true":
+            # Ramping up (3.1g)
+            def eRampingUp_rule(model, g0, g1, t):
+                if t == T[0]:  # Skip the first time step for ramping constraints
+                    return pyo.Constraint.Skip
+                return (
+                    # model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
+                    # <= pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] # ! Transform to <= 0
+                    (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) - (pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) <= 0
+                )
+            model.eRampingUp = pyo.Constraint(G, T, rule=eRampingUp_rule)
+
+            # Ramping down (3.1f)
+            def eRampingDown_rule(model, g0, g1, t):
+                if t == T[0]:  # Skip the first time step for ramping constraints
+                    return pyo.Constraint.Skip
+                return (
+                    # -pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
+                    # <= model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]] # ! Transform to <= 0
+                    (-pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) - (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) <= 0
+                )
+            model.eRampingDown = pyo.Constraint(G, T, rule=eRampingDown_rule)
+
+    def eGenProdPositive_rule(model, g0, g1, t):
+        return -1 * model.vGenProd[(g0, g1), t] <= 0
+    
+    model.eGenProdPositive = pyo.Constraint(G, T, rule=eGenProdPositive_rule)
+
+    def eMissedDemandPositive_rule(model, n, t):
+        return -1 * model.vLossLoad[n, t] <= 0
+    model.eMissedDemandPositive = pyo.Constraint(N, T, rule=eMissedDemandPositive_rule)
+
+    def eMissedDemandLeqDemand_rule(model, n, t):
+        return model.vLossLoad[n, t] - pDemand[n, t] <= 0
+    model.eMissedDemandLeqDemand = pyo.Constraint(N, T, rule=eMissedDemandLeqDemand_rule)
+
+    if not constant_gen_inv: 
+        def eGenInvPositive_rule(model, g0, g1):
+            return -1 * model.vGenInv[(g0, g1)] <= 0
+    
+        model.eGenInvPositive = pyo.Constraint(G, rule=eGenInvPositive_rule)
+
+    ## Step 4: Solve
+    print("Solving the optimization problem")
+    # results = solver.solve(model, tee=True)
+    results = solver.solve(model, tee=False)
+    time_taken = solver._solver_model.Runtime
+
+    print(f"Objective Value: {model.obj()}")
+    return model, solver, time_taken
 
 def get_variable_values_as_list(var):
     # Check if the variable is indexed
@@ -265,66 +563,15 @@ if __name__ == "__main__":
         # Setup output dataframe
         df_res = pd.DataFrame(columns=["setup_time", "presolve_time", "barrier_time", "crossover_time", "restore_time", "objective_value"])
 
-        T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap = prep_data(experiment_instance)
+        with open("config.json", "r") as file:
+            args = json.load(file)
+
+        T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap = prep_data(experiment_instance, N=args["N"], G=args["G"], L=args["L"])
 
         T_ranges = [range(i, i + SAMPLE_DURATION, 1) for i in range(1, len(T), SAMPLE_DURATION)]
-        objective_values = []
-        times = []
-        train_size = 584
-        val_size = 73
-        # for t in T_ranges[train_size:train_size+val_size]:
         for t in T_ranges[:1]:
             # Run one experiment for j repeats
             model, solver, time_taken = run_model(experiment_instance, t, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
-            
-            
-            # print("Print values for all variables")
-            # for v in model.component_data_objects(pyo.Var):
-            #     print(str(v), v.value)
-            print(model.obj())
-            objective_values.append(model.obj())
-            times.append(time_taken)
-            print(time)
-
-
-            # # Check symmetry and append results
-            # if experiment_instance["symmetry"] == "s2":
-            #     df_res = pd.concat([
-            #         df_res,
-            #         pd.DataFrame({
-            #             "setup_time": [setup_time],
-            #             "presolve_time": ["-"],
-            #             "barrier_time": ["-"],
-            #             "crossover_time": ["-"],
-            #             "restore_time": [restore_time],
-            #             "objective_value": [res.invCost + res.opeCost]
-            #         })
-            #     ], ignore_index=True)
-            # else:
-            #     df_res = pd.concat([
-            #         df_res,
-            #         pd.DataFrame({
-            #             "setup_time": [setup_time],
-            #             "presolve_time": ["-"],
-            #             "barrier_time": ["-"],
-            #             "crossover_time": ["-"],
-            #             "restore_time": [restore_time],
-            #             "objective_value": [objective_value(res)]
-            #         })
-            #     ], ignore_index=True)
-            # model.display()
-
-        # Write DataFrame to CSV
-        # df_res.to_csv(experiment_instance["output_file"], index=False)
-
-
-        # Write the number to the file
-        # file_path = os.path.join("outputs/Gurobi", f"VAL_SET_samplesize_{str(SAMPLE_DURATION)}_node_{len(N)}_gen_{len(G)}_lines_{len(L)}.txt")
-        # with open(file_path, "w") as file:
-        #     file.write(f"N: {str(N)}\n")
-        #     file.write(f"G: {str(G)}\n")
-        #     file.write(f"L: {str(L)}\n")
-        #     file.write(f"Obj value mean: {str(np.mean(objective_values))}\n")
-        #     file.write(f"Time taken mean: {str(np.mean(times))}\n")
+            print(f"Operating costs: {model.vOpeCost.value}")
 
     

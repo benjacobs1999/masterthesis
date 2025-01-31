@@ -29,7 +29,7 @@ from setproctitle import setproctitle
 import os
 import argparse
 
-from utils import my_hash, str_to_bool
+from old_gep_code.utils import my_hash, str_to_bool
 import default_args
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")

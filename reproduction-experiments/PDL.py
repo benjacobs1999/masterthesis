@@ -13,7 +13,7 @@ from functools import reduce
 from torch.utils.data import TensorDataset, DataLoader
 
 import default_args
-from utils import my_hash
+from old_gep_code.utils import my_hash
 from torch.utils.tensorboard import SummaryWriter
 
 torch.set_default_dtype(torch.float32)

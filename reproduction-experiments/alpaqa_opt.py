@@ -10,7 +10,7 @@ import os
 import argparse
 import torch
 
-from utils import my_hash, str_to_bool
+from old_gep_code.utils import my_hash, str_to_bool
 import default_args
 import cProfile
 

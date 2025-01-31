@@ -7,7 +7,7 @@ import torch
 import sys
 import os
 sys.path.insert(1, os.path.join(sys.path[0], os.pardir, os.pardir))
-from utils import SimpleProblem
+from old_gep_code.utils import SimpleProblem
 
 import os
 os.environ['KMP_DUPLICATE_LIB_OK']='True'

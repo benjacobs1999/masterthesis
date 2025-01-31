@@ -1,20 +1,33 @@
 import pickle
 import time
 
-import numpy as np
 from gep_config_parser import *
 from data_wrangling import dataframe_to_dict
 
 from primal_dual import PrimalDualTrainer
-from gep_problem import GEPProblem
-from gep_main import run_model as run_Gurobi
-import sys
-import torch
+from gep_problem import GEPProblemSet
+from gep_problem_operational import GEPOperationalProblemSet
 
 CONFIG_FILE_NAME        = "config.toml"
 VISUALIZATION_FILE_NAME = "visualization.toml"
-SAMPLE_DURATION = 12
-# SAMPLE_DURATION = 120
+
+
+SCALE_FACTORS = {
+    "pDemand": 1/1000,  # MW -> GW
+    "pGenAva": 1,       # Don't scale
+    "pVOLL": 1/1000,         # kEUR/MWh -> mEUR/GWh
+    "pWeight": 1,       # Don't scale
+    "pRamping": 1,      # Don't scale
+    "pInvCost": 1/1000,      # kEUR/MW -> mEUR/GW
+    "pVarCost": 1/1000,      # kEUR/MWh -> mEUR/GWh
+    "pUnitCap": 1/1000, # MW -> GW
+    "pExpCap": 1/1000,  # MW -> GW
+    "pImpCap": 1/1000,  # MW -> GW
+}
+
+def scale_dict(data_dict, scale_factor):
+    return {key: value * scale_factor for key, value in data_dict.items()}
+
 
 ## Step 1: parse the input data
 print("Parsing the config file")
@@ -23,22 +36,22 @@ data = parse_config(CONFIG_FILE_NAME)
 experiment = data["experiment"]
 outputs_config = data["outputs_config"]
 
-def prep_data(inputs, shuffle=False):
+
+def prep_data(inputs, N=None, G=None, L=None, train=0.8, valid=0.1, test=0.1, scale=True, sample_duration=12, constant_gen_inv=False):
     print("Wrangling the input data")
 
     # Extract sets
     T = inputs["times"] # [1, 2, 3, ... 8760] ---> 8760
-    G = inputs["generators"] # [('Country1', 'EnergySource1'), ...] ---> 107
-    L = inputs["transmission_lines"] # [('Country1', 'Country2'), ...] ---> 44
-    N = inputs["nodes"] # ['Country1', 'Country2', ...] ---> 20
 
-    ### SET UP CUSTOM CONFIG ###
-    # N = ['BEL', 'FRA', 'GER', 'NED'] # 4 nodes
-    N = ['BEL', 'GER', 'NED'] # 3 nodes
-    # G = [('BEL', 'SunPV'), ('FRA', 'SunPV'), ('GER', 'SunPV'), ('NED', 'SunPV')] # 4 generators
-    G = [('BEL', 'SunPV'), ('GER', 'SunPV'), ('NED', 'SunPV')] # 3 generators
-    # L = [('BEL', 'FRA'), ('BEL', 'GER'), ('BEL', 'NED'), ('GER', 'FRA'), ('GER', 'NED')] # 5 lines
-    L = [('BEL', 'GER'), ('BEL', 'NED'), ('GER', 'NED')] # 3 lines
+    if not (N or G or L):
+        G = inputs["generators"] # [('Country1', 'EnergySource1'), ...] ---> 107
+        L = inputs["transmission_lines"] # [('Country1', 'Country2'), ...] ---> 44
+        N = inputs["nodes"] # ['Country1', 'Country2', ...] ---> 20
+    else:
+        # Convert to tuples
+        # N = [tuple(pair) for pair in N]
+        G = [tuple(pair) for pair in G]
+        L = [tuple(pair) for pair in L]
 
     # Extract time series data
     pDemand = dataframe_to_dict(
@@ -46,6 +59,7 @@ def prep_data(inputs, shuffle=False):
         keys=["Country", "Time"],
         value="Demand_MW"
     )
+    
     pGenAva = dataframe_to_dict(
         inputs["generation_availability_data"],
         keys=["Country", "Technology", "Time"],
@@ -57,7 +71,7 @@ def prep_data(inputs, shuffle=False):
 
     # WOP
     # Scale inversely proportional to times (T)
-    pWeight = inputs["representative_period_weight"] / (SAMPLE_DURATION / 8760)
+    pWeight = inputs["representative_period_weight"] / (sample_duration / 8760)
 
     pRamping = inputs["ramping_value"]
 
@@ -67,11 +81,13 @@ def prep_data(inputs, shuffle=False):
         keys=["Country", "Technology"],
         value="InvCost_kEUR_MW_year"
     )
+
     pVarCost = dataframe_to_dict(
         inputs["generation_data"],
         keys=["Country", "Technology"],
         value="VarCost_kEUR_per_MWh"
     )
+
     pUnitCap = dataframe_to_dict(
         inputs["generation_data"],
         keys=["Country", "Technology"],
@@ -84,11 +100,25 @@ def prep_data(inputs, shuffle=False):
         keys=["CountryA", "CountryB"],
         value="ExpCap_MW"
     )
+
     pImpCap = dataframe_to_dict(
         inputs["transmission_lines_data"],
         keys=["CountryA", "CountryB"],
         value="ImpCap_MW"
     )
+
+    if scale:
+        pDemand = scale_dict(pDemand, SCALE_FACTORS["pDemand"])
+        pGenAva = scale_dict(pGenAva, SCALE_FACTORS["pGenAva"])
+        pVOLL *= SCALE_FACTORS["pVOLL"]
+        pWeight *= SCALE_FACTORS["pWeight"]
+        pRamping *= SCALE_FACTORS["pRamping"]
+        pInvCost = scale_dict(pInvCost, SCALE_FACTORS["pInvCost"])
+        pVarCost = scale_dict(pVarCost, SCALE_FACTORS["pVarCost"])
+        pUnitCap = scale_dict(pUnitCap, SCALE_FACTORS["pUnitCap"])
+        pExpCap = scale_dict(pExpCap, SCALE_FACTORS["pExpCap"])
+        pImpCap = scale_dict(pImpCap, SCALE_FACTORS["pImpCap"])
+
 
     # We need to sort the dictionaries for changing to tensors!
     pDemand = dict(sorted(pDemand.items()))
@@ -101,45 +131,26 @@ def prep_data(inputs, shuffle=False):
 
 
     print("Creating problem instance")
-    data = GEPProblem(T, G, L, N, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, sample_duration=SAMPLE_DURATION, shuffle=shuffle)
+    if constant_gen_inv:
+        data = GEPOperationalProblemSet(T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, sample_duration=sample_duration, train=train, valid=valid, test=test)
+    else:
+        data = GEPProblemSet(T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, sample_duration=sample_duration, train=train, valid=valid, test=test)
 
     return data
 
-def run_PDL(data, args, save_dir, optimal_objective):
+def run_PDL(data, args, save_dir):
     # Run PDL
     print("Training the PDL")
-    trainer = PrimalDualTrainer(data, args, save_dir, optimal_objective=optimal_objective)
+    trainer = PrimalDualTrainer(data, args, save_dir)
     primal_net, dual_net, stats = trainer.train_PDL()
-    
-
 
 if __name__ == "__main__":
-    args = {
-            # "K": 2,
-            "K": 25,
-            # "L": 10,
-            "L": 500,
-            "tau": 0.8,
-            "rho": 0.01,
-            # "rho": 1e-5,
-            "rho_max": 100000,
-            # "rho_max": sys.maxsize * 2 + 1,
-            "alpha": 5,
-            # "alpha": 2,
-            # "batch_size": 584, # Full training set!
-            "batch_size": 10000,
-            "hidden_size": 500,
-            # "hidden_size": 1000,
-            "primal_lr": 1e-4,
-            "dual_lr": 1e-4,
-            # "primal_lr": 1e-5,
-            # "dual_lr": 1e-5,
-            # "decay": 0.99,
-            "decay": 0.99,
-            "patience": 10,
-            "corrEps": 1e-4,
-            "shuffle": False,
-    }
+    import json
+
+    with open("config.json", "r") as file:
+        args = json.load(file)
+    
+    print(args)
 
     # Train the model:
     for i, experiment_instance in enumerate(experiment["experiments"]):
@@ -148,7 +159,7 @@ if __name__ == "__main__":
 
         for j in range(experiment["repeats"]):
             # Run one experiment for j repeats
-            run_name = "2024-12-09"
+            run_name = f"refactored_train:{args['train']}_rho:{args['rho']}_rhomax:{args['rho_max']}_alpha:{args['alpha']}_L:{args['alpha']}"
             save_dir = os.path.join('outputs', 'PDL',
                 run_name + "-" + str(time.time()).replace('.', '-'))
             if not os.path.exists(save_dir):
@@ -157,34 +168,11 @@ if __name__ == "__main__":
                 pickle.dump(args, f)
             
             # Prep proble data:
-            data = prep_data(experiment_instance, shuffle=args["shuffle"])
+            data = prep_data(experiment_instance, N=args["N"], G=args["G"], L=args["L"], train=args["train"], valid=args["valid"], test=args["test"], scale=args["scale_problem"], sample_duration=args["sample_duration"], constant_gen_inv=args["operational"])
 
-            # Run Gurobi
-            # experiment_instance, t, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap
-            opt_objs_val = []
-            for t in data.val_time_ranges:
-                model, solver, time_taken = run_Gurobi(experiment_instance,
-                           t,
-                           data.N,
-                           data.G,
-                           data.L,
-                           data.pDemand,
-                           data.pGenAva,
-                           data.pVOLL,
-                           data.pWeight,
-                           data.pRamping,
-                           data.pInvCost,
-                           data.pVarCost,
-                           data.pUnitCap,
-                           data.pExpCap,
-                           data.pImpCap)
-                opt_objs_val.append(model.obj())
-            
-            avg_opt_obj = np.mean(opt_objs_val)
-
-            print(avg_opt_obj)
+            data.obj_fn(data._opt_targets["y"][:1])
 
             # Run PDL
-            run_PDL(data, args, save_dir, optimal_objective=avg_opt_obj)
+            run_PDL(data, args, save_dir)
 
 

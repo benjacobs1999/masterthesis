@@ -1,0 +1,5 @@
+N: ['BEL', 'FRA', 'GER', 'NED']
+G: [('BEL', 'SunPV'), ('FRA', 'SunPV'), ('GER', 'SunPV'), ('NED', 'SunPV')]
+L: [('BEL', 'FRA'), ('BEL', 'GER'), ('BEL', 'NED'), ('GER', 'FRA'), ('GER', 'NED')]
+Obj value mean: 1339469255.797373
+Time taken mean: 0.008410560921446918

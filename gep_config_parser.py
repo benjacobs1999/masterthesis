@@ -1,3 +1,5 @@
+#! Code taken from Matthijs Arnoldus' thesis (transferred to Python from Julia)
+
 from typing import Dict, Any
 import os
 import toml
