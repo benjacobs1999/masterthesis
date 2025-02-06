@@ -3,7 +3,7 @@
 ### Environment
 To create an environment with the correct packages, type the following commands in the terminal:
 
-1. `conda create -n {env_name} python=3.9`
+1. `conda create -n {env_name} python=3.9.20`
 2. `conda activate {env_name}`
 3. `pip install -r requirements.txt`
 
