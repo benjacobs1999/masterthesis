@@ -5,32 +5,42 @@ import torch
 class OptValueExtractor:
     def __init__(self, constant_gen_inv=False):
         self.constant_gen_inv = constant_gen_inv
-        self.targets = {"y": [], "mu": [], "lamb": []}
+        self.targets = {"y_gep": [], "y_operational": [], "y_investment": [], "mu_gep": [], "mu_operational": [], "lamb_gep": [], "lamb_operational": []}
     
     @property
     def opt_targets(self):
-        return {"y": torch.stack(self.targets["y"]), "mu": torch.stack(self.targets["mu"]), "lamb": torch.stack(self.targets["lamb"])}
+        return {"y_gep": torch.stack(self.targets["y_gep"]),
+                "y_operational": torch.stack(self.targets["y_operational"]),
+                "y_investment": torch.stack(self.targets["y_investment"]),
+                "mu_gep": torch.stack(self.targets["mu_gep"]), 
+                "mu_operational": torch.stack(self.targets["mu_operational"]), 
+                "lamb_gep": torch.stack(self.targets["lamb_gep"]),
+                "lamb_operational": torch.stack(self.targets["lamb_operational"])}
 
     def extract_values(self, model):
-        decision_vars = torch.tensor(self.extract_decision_variables(model))
-        dual_vars_ineq, dual_vars_eq = self.extract_dual_vars(model)
-        dual_vars_ineq = torch.tensor(dual_vars_ineq)
-        dual_vars_eq = torch.tensor(dual_vars_eq)
-        self.targets["y"].append(decision_vars)
-        self.targets["mu"].append(dual_vars_ineq)
-        self.targets["lamb"].append(dual_vars_eq)
+        decision_vars_gep, decision_vars_operational, decision_vars_investment = self.extract_decision_variables(model)
+        dual_vars_ineq_gep, dual_vars_ineq_operational, dual_vars_eq = self.extract_dual_vars(model)
+        self.targets["y_gep"].append(torch.tensor(decision_vars_gep, dtype=torch.float64))
+        self.targets["y_operational"].append(torch.tensor(decision_vars_operational, dtype=torch.float64))
+        self.targets["y_investment"].append(torch.tensor(decision_vars_investment, dtype=torch.float64))
+        self.targets["mu_gep"].append(torch.tensor(dual_vars_ineq_gep, dtype=torch.float64))
+        self.targets["mu_operational"].append(torch.tensor(dual_vars_ineq_operational, dtype=torch.float64))
+        # Lamb is the same for gep and operational.
+        self.targets["lamb_gep"].append(torch.tensor(dual_vars_eq, dtype=torch.float64))
+        self.targets["lamb_operational"].append(torch.tensor(dual_vars_eq, dtype=torch.float64))
 
 
     def extract_decision_variables(self, model):
         """Extracts decision variables in time-first order: [c0t0, c1t0, c0t1, c1t1, ...]."""
         
         # Select variables based on whether generator investment is constant
-        if self.constant_gen_inv:
-            variables = [model.vGenProd, model.vLineFlow, model.vLossLoad]
-        else:
-            raise NotImplementedError("This method needs to be implemented for non-fixed investment variables")
+        # if self.constant_gen_inv:
+        variables = [model.vGenProd, model.vLineFlow, model.vLossLoad]
+        # else:
+            # raise NotImplementedError("This method needs to be implemented for non-fixed investment variables")
 
-        decision_vars = []
+        decision_vars_operational = []
+        decision_vars_investment = []
 
         # Extract time indices from one of the indexed variables (assuming they share time structure)
         sample_var = variables[0]
@@ -45,12 +55,21 @@ class OptValueExtractor:
                 if var.is_indexed():
                     for idx in var:
                         if idx[-1] == t:  # Extract values in time order
-                            decision_vars.append(var[idx].value)
+                            decision_vars_operational.append(var[idx].value)
                 else:
                     # Handle scalar variables (not indexed)
-                    decision_vars.append(var.value)
+                    decision_vars_operational.append(var.value)
+        
+        # Add investment variables
+        if model.vGenInv.is_indexed():
+            for idx in model.vGenInv:
+                decision_vars_investment.append(model.vGenInv[idx].value)
+        else:
+            decision_vars_investment.append(model.vGenInv.value)
 
-        return decision_vars
+        decision_vars_gep = decision_vars_operational + decision_vars_investment
+
+        return decision_vars_gep, decision_vars_operational, decision_vars_investment
 
 
     def extract_dual_vars(self, model):
@@ -59,7 +78,7 @@ class OptValueExtractor:
         # Define constraints based on whether generator investment is constant
         if self.constant_gen_inv:
             ineq_constraints = [
-                model.eMaxProd, model.eLineFlowLB, model.eLineFlowUB, model.eGenProdPositive, model.eMissedDemandPositive, model.eMissedDemandLeqDemand
+                model.eGenProdPositive, model.eMaxProd, model.eLineFlowLB, model.eLineFlowUB, model.eMissedDemandPositive, model.eMissedDemandLeqDemand, model.eGenInvPositive
             ]  # First vLineFlow = lower bound, second is upper bound.
         else:
             raise NotImplementedError("This method needs to be implemented for non-fixed investment variables")
@@ -67,7 +86,8 @@ class OptValueExtractor:
         # Equality constraints
         eq_constraints = [model.eNodeBal]
 
-        dual_vars_ineq = []
+        dual_vars_ineq_operational = []
+        dual_vars_ineq_investment = []
         dual_vars_eq = []
 
         # Extract time indices from one of the indexed constraints (assuming all have the same time structure)
@@ -77,7 +97,7 @@ class OptValueExtractor:
         else:
             time_indices = [None]  # If constraints aren't indexed, treat it as a single time step
 
-        #! For some reason, Gurobi flips the sign of dual variables (negative for 3.1i, should be positive by KKT)
+        #! For some reason, Gurobi flips the sign of dual variables --> Probably because it is treated as minimization instead of maximization by Gurobi internally.
         # Iterate over time steps first
         for t in time_indices:
             for item in ineq_constraints:
@@ -85,14 +105,27 @@ class OptValueExtractor:
                     for idx in item:
                         if idx[-1] == t:  # Ensure we only take constraints at the current time step
                             if item[idx] in model.dual:
-                                dual_vars_ineq.append(-model.dual[item[idx]])
+                                dual_vars_ineq_operational.append(-model.dual[item[idx]])
                             else:
-                                dual_vars_ineq.append(0)  # Append 0 if no dual exists
+                                dual_vars_ineq_operational.append(0)  # Append 0 if no dual exists
                 else:  # Handle scalar constraints
                     if item in model.dual:
-                        dual_vars_ineq.append(-model.dual[item])
+                        dual_vars_ineq_operational.append(-model.dual[item])
                     else:
-                        dual_vars_ineq.append(0)
+                        dual_vars_ineq_operational.append(0)
+        
+        # Add investment constraints
+        if model.eGenInvPositive.is_indexed():
+            for idx in model.eGenInvPositive:
+                if model.eGenInvPositive[idx] in model.dual:
+                    dual_vars_ineq_investment.append(-model.dual[model.eGenInvPositive[idx]])
+                else:
+                    dual_vars_ineq_investment.append(0)
+        else:
+            if model.eGenInvPositive in model.dual:
+                dual_vars_ineq_investment.append(-model.dual[model.eGenInvPositive])
+            else:
+                dual_vars_ineq_investment.append(0)
 
         # Iterate over time for equality constraints
         for t in time_indices:
@@ -110,7 +143,9 @@ class OptValueExtractor:
                     else:
                         dual_vars_eq.append(0)
 
-        return dual_vars_ineq, dual_vars_eq
+        dual_vars_ineq_gep = dual_vars_ineq_operational + dual_vars_ineq_investment
+
+        return dual_vars_ineq_gep, dual_vars_ineq_operational, dual_vars_eq
 
 if __name__ == "__main__":
     import pickle
@@ -168,8 +203,8 @@ if __name__ == "__main__":
                         data.pUnitCap,
                         data.pExpCap,
                         data.pImpCap,
-                        constant_gen_inv=args["operational"])
+                        )
             extractor.extract_values(model)
         
-        with open(os.path.join("outputs/Gurobi", f"BEL_GER_SUN-OPERATIONAL={args['operational']}-GEP_OPT_TARGETS_T={args['sample_duration']}"), 'wb') as f:
+        with open(os.path.join("outputs/Gurobi", f"{args['G']}-OPT_TARGETS_T={args['sample_duration']}"), 'wb') as f:
                 pickle.dump(extractor.opt_targets, f)

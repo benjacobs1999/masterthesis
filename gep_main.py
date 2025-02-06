@@ -150,6 +150,7 @@ def run_model(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pI
     # ! Keep GenInv constant, instead of a decision variable (change to operational problem):
     if constant_gen_inv:
         pGenInv = {('BEL', 'SunPV'): 4130.05009001755, ('GER', 'SunPV'): 11232.550865341998}
+        # With Gas and Sun:
     
     # Extract optimizer attributes
     attributes = data["optimizer_config"][optimizer_name]
@@ -324,16 +325,18 @@ def get_variable_values_as_list(var):
         # For scalar variables
         return [var.value]
 
-def run_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, constant_gen_inv=False):
+def run_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap):
     """This model is a slower implementation, which does not use any bounds (domains), but is instead modeled using only constraints, so that it is in line with the GEP problem for PDL, 
     where all of the domains are processed as constraints, and the inequality constraints are rewritten to the form <= 0, and equality constraints to the form = 0.
     We do this so that we can directly compare the solver output to PDL.
     """
 
     # ! Keep GenInv constant, instead of a decision variable (change to operational problem):
-    if constant_gen_inv:
-        # pGenInv = {('BEL', 'Gas'): 26.13, ('GER', 'Gas'): 129.78} # 3 generators
-        pGenInv = {('BEL', 'SunPV'): 4130.05009001755, ('GER', 'SunPV'): 11232.550865341998}
+    # if constant_gen_inv:
+        # pGenInv = {('BEL', 'SunPV'): 4130.05009001755, ('GER', 'SunPV'): 11232.550865341998, ('BEL', 'Gas'): 4130.05009001755, ('GER', 'Gas'): 11232.550865341998}
+        # With gas and sun:
+        # 361.86402118882216, 0.0, 26.82598871780973, 164.8367340122868
+        # pGenInv = {('BEL', 'SunPV'): 361.86402118882216, ('GER', 'SunPV'): 0.0, ('BEL', 'Gas'): 26.82598871780973, ('GER', 'Gas'): 164.8367340122868}
     
     # Extract optimizer attributes
     attributes = data["optimizer_config"][optimizer_name]
@@ -362,13 +365,13 @@ def run_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pR
     # Operational cost variable (non-negative)
     model.vOpeCost = pyo.Var(within=pyo.NonNegativeReals, initialize=0)
 
-    if not constant_gen_inv:
-        # Generator investment variables
-        if inputs["relaxed"] == "true":
-            # model.vGenInv = pyo.Var(G, within=pyo.NonNegativeReals, initialize=0)
-            model.vGenInv = pyo.Var(G, initialize=0) #! Remove the domain.
-        else:
-            model.vGenInv = pyo.Var(G, within=pyo.Integers, bounds=(0, None), initialize=0)
+    # if not constant_gen_inv:
+    # Generator investment variables
+    if inputs["relaxed"] == "true":
+        # model.vGenInv = pyo.Var(G, within=pyo.NonNegativeReals, initialize=0)
+        model.vGenInv = pyo.Var(G, initialize=0) #! Remove the domain.
+    else:
+        model.vGenInv = pyo.Var(G, within=pyo.Integers, bounds=(0, None), initialize=0)
 
     # Generator production variables (non-negative)
     # model.vGenProd = pyo.Var(G, T, within=pyo.NonNegativeReals, initialize=0)
@@ -401,16 +404,16 @@ def run_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pR
     # Investment costs
     # Sum_{g in G} IC_g * UCAP_g * ui_g
     # Investment cost (€/MW) * capacity of a unit (MW) * nr of units = Investment cost at g (€)
-    if constant_gen_inv:
-        def eInvCost_rule(model):
-            return model.vInvCost == sum(
-                pInvCost[g] * pUnitCap[g] * pGenInv[g] for g in G
-            )
-    else:
-        def eInvCost_rule(model):
-            return model.vInvCost == sum(
-                pInvCost[g] * pUnitCap[g] * model.vGenInv[g] for g in G
-            )
+    # if constant_gen_inv:
+    #     def eInvCost_rule(model):
+    #         return model.vInvCost == sum(
+    #             pInvCost[g] * pUnitCap[g] * pGenInv[g] for g in G
+    #         )
+    # else:
+    def eInvCost_rule(model):
+        return model.vInvCost == sum(
+            pInvCost[g] * pUnitCap[g] * model.vGenInv[g] for g in G
+        )
     model.eInvCost = pyo.Constraint(rule=eInvCost_rule)
 
     # Operating costs
@@ -426,16 +429,16 @@ def run_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pR
 
     # (3.1b)
     # Ensure production never exceeds capacity
-    if constant_gen_inv:
-        def eMaxProd_rule(model, g0, g1, t):
-            availability = pGenAva.get((g0, g1, t), 1.0)  # Default availability to 1.0
-            # return model.vGenProd[(g0, g1), t] <= availability * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] #! Rewrite to <= 0
-            return model.vGenProd[(g0, g1), t] - (availability * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]) <= 0
-    else:
-        def eMaxProd_rule(model, g0, g1, t):
-            availability = pGenAva.get((g0, g1, t), 1.0)  # Default availability to 1.0
-            # return model.vGenProd[(g0, g1), t] <= availability * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] #! Rewrite to <= 0
-            return model.vGenProd[(g0, g1), t] - (availability * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) <= 0
+    # if constant_gen_inv:
+    #     def eMaxProd_rule(model, g0, g1, t):
+    #         availability = pGenAva.get((g0, g1, t), 1.0)  # Default availability to 1.0
+    #         # return model.vGenProd[(g0, g1), t] <= availability * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] #! Rewrite to <= 0
+    #         return model.vGenProd[(g0, g1), t] - (availability * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]) <= 0
+    # else:
+    def eMaxProd_rule(model, g0, g1, t):
+        availability = pGenAva.get((g0, g1, t), 1.0)  # Default availability to 1.0
+        # return model.vGenProd[(g0, g1), t] <= availability * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] #! Rewrite to <= 0
+        return model.vGenProd[(g0, g1), t] - (availability * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) <= 0
         
     model.eMaxProd = pyo.Constraint(G, T, rule=eMaxProd_rule)
 
@@ -475,52 +478,52 @@ def run_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pR
 
     # Ramping constraints
     # No large changes in production between timesteps
-    if constant_gen_inv:
-        if inputs["ramping"] == "true":
-            # Ramping up (3.1g)
-            def eRampingUp_rule(model, g0, g1, t):
-                if t == T[0]:  # Skip the first time step for ramping constraints
-                    return pyo.Constraint.Skip
-                return (
-                    # model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
-                    # <= pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] # ! Transform to <= 0
-                    (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) - (pRamping * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]) <= 0
-                )
-            model.eRampingUp = pyo.Constraint(G, T, rule=eRampingUp_rule)
+    # if constant_gen_inv:
+    #     if inputs["ramping"] == "true":
+    #         # Ramping up (3.1g)
+    #         def eRampingUp_rule(model, g0, g1, t):
+    #             if t == T[0]:  # Skip the first time step for ramping constraints
+    #                 return pyo.Constraint.Skip
+    #             return (
+    #                 # model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
+    #                 # <= pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] # ! Transform to <= 0
+    #                 (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) - (pRamping * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]) <= 0
+    #             )
+    #         model.eRampingUp = pyo.Constraint(G, T, rule=eRampingUp_rule)
 
-            # Ramping down (3.1f)
-            def eRampingDown_rule(model, g0, g1, t):
-                if t == T[0]:  # Skip the first time step for ramping constraints
-                    return pyo.Constraint.Skip
-                return (
-                    # -pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
-                    # <= model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]] # ! Transform to <= 0
-                    (-pRamping * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]) - (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) <= 0
-                )
-            model.eRampingDown = pyo.Constraint(G, T, rule=eRampingDown_rule)
-    else:
-        if inputs["ramping"] == "true":
-            # Ramping up (3.1g)
-            def eRampingUp_rule(model, g0, g1, t):
-                if t == T[0]:  # Skip the first time step for ramping constraints
-                    return pyo.Constraint.Skip
-                return (
-                    # model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
-                    # <= pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] # ! Transform to <= 0
-                    (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) - (pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) <= 0
-                )
-            model.eRampingUp = pyo.Constraint(G, T, rule=eRampingUp_rule)
+    #         # Ramping down (3.1f)
+    #         def eRampingDown_rule(model, g0, g1, t):
+    #             if t == T[0]:  # Skip the first time step for ramping constraints
+    #                 return pyo.Constraint.Skip
+    #             return (
+    #                 # -pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
+    #                 # <= model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]] # ! Transform to <= 0
+    #                 (-pRamping * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]) - (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) <= 0
+    #             )
+    #         model.eRampingDown = pyo.Constraint(G, T, rule=eRampingDown_rule)
+    # else:
+    if inputs["ramping"] == "true":
+        # Ramping up (3.1g)
+        def eRampingUp_rule(model, g0, g1, t):
+            if t == T[0]:  # Skip the first time step for ramping constraints
+                return pyo.Constraint.Skip
+            return (
+                # model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
+                # <= pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] # ! Transform to <= 0
+                (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) - (pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) <= 0
+            )
+        model.eRampingUp = pyo.Constraint(G, T, rule=eRampingUp_rule)
 
-            # Ramping down (3.1f)
-            def eRampingDown_rule(model, g0, g1, t):
-                if t == T[0]:  # Skip the first time step for ramping constraints
-                    return pyo.Constraint.Skip
-                return (
-                    # -pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
-                    # <= model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]] # ! Transform to <= 0
-                    (-pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) - (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) <= 0
-                )
-            model.eRampingDown = pyo.Constraint(G, T, rule=eRampingDown_rule)
+        # Ramping down (3.1f)
+        def eRampingDown_rule(model, g0, g1, t):
+            if t == T[0]:  # Skip the first time step for ramping constraints
+                return pyo.Constraint.Skip
+            return (
+                # -pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
+                # <= model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]] # ! Transform to <= 0
+                (-pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) - (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) <= 0
+            )
+        model.eRampingDown = pyo.Constraint(G, T, rule=eRampingDown_rule)
 
     def eGenProdPositive_rule(model, g0, g1, t):
         return -1 * model.vGenProd[(g0, g1), t] <= 0
@@ -535,11 +538,11 @@ def run_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pR
         return model.vLossLoad[n, t] - pDemand[n, t] <= 0
     model.eMissedDemandLeqDemand = pyo.Constraint(N, T, rule=eMissedDemandLeqDemand_rule)
 
-    if not constant_gen_inv: 
-        def eGenInvPositive_rule(model, g0, g1):
-            return -1 * model.vGenInv[(g0, g1)] <= 0
-    
-        model.eGenInvPositive = pyo.Constraint(G, rule=eGenInvPositive_rule)
+    # if not constant_gen_inv: 
+    def eGenInvPositive_rule(model, g0, g1):
+        return -1 * model.vGenInv[(g0, g1)] <= 0
+
+    model.eGenInvPositive = pyo.Constraint(G, rule=eGenInvPositive_rule)
 
     ## Step 4: Solve
     print("Solving the optimization problem")
@@ -571,7 +574,7 @@ if __name__ == "__main__":
         T_ranges = [range(i, i + SAMPLE_DURATION, 1) for i in range(1, len(T), SAMPLE_DURATION)]
         for t in T_ranges[:1]:
             # Run one experiment for j repeats
-            model, solver, time_taken = run_model(experiment_instance, t, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
-            print(f"Operating costs: {model.vOpeCost.value}")
-
+            model, solver, time_taken = run_model_no_bounds(experiment_instance, t, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
+            # print(get_variable_values_as_list(model.vGenInv))
+            # print(f"Operating costs: {model.vOpeCost.value}")
     

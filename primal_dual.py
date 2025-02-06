@@ -65,9 +65,9 @@ class TensorBoardLogger():
             obj = data.obj_fn(Y)
             dual_obj = data.dual_obj_fn(data.eq_rhs[data.train_indices], data.ineq_rhs[data.train_indices], mu, lamb)
 
-            Y_target = data.opt_targets["y"][data.train_indices]
-            mu_target = data.opt_targets["mu"][data.train_indices]
-            lamb_target = data.opt_targets["lamb"][data.train_indices]
+            Y_target = data.opt_targets["y_operational"][data.train_indices]
+            mu_target = data.opt_targets["mu_operational"][data.train_indices]
+            lamb_target = data.opt_targets["lamb_operational"][data.train_indices]
 
             ineq_resid = data.ineq_resid(Y, data.ineq_cm[data.train_indices], data.ineq_rhs[data.train_indices])
             ineq_dist = data.ineq_dist(Y, data.ineq_cm[data.train_indices], data.ineq_rhs[data.train_indices])
@@ -166,117 +166,6 @@ class TensorBoardLogger():
 
     def log_val(self, data, primal_net, dual_net):
         pass
-
-    def plot_variable_differences(self, data, primal_net, dual_net):
-        with torch.no_grad():
-            # Predictions and targets for primal variables
-            Y = primal_net(data.X[data.train_indices], data.eq_rhs[data.train_indices], data.ineq_rhs[data.train_indices])
-            Y_target = data.opt_targets["y"][data.train_indices]
-            
-            # Predictions and targets for dual variables
-            mu, lamb = dual_net(data.X[data.train_indices])
-            mu_target = data.opt_targets["mu"][data.train_indices]
-            lamb_target = data.opt_targets["lamb"][data.train_indices]
-            
-            # Indices for primal variables
-            gen_prod_indices = data.p_gt_indices
-            lineflow_indices = data.f_lt_indices
-            missed_demand_indices = data.md_nt_indices
-            units_invested_indices = data.ui_g_indices
-            
-            # Indices for dual variables
-            dual_inequality_indices = [
-                (data.constraint_b_indices, 'mu_b'),
-                (data.constraint_d_indices, 'mu_d'),
-                (data.constraint_e_indices, 'mu_e'),
-                (data.constraint_f_indices, 'mu_f'),
-                (data.constraint_g_indices, 'mu_g'),
-                (data.constraint_h_indices, 'mu_h'),
-                (data.constraint_i_indices, 'mu_i'),
-                (data.constraint_j_indices, 'mu_j'),
-                (data.constraint_k_indices, 'mu_k')
-            ]
-            dual_equality_indices = [(data.constraint_c_indices, 'lamb_c')]
-
-            # Combine all variables into a single plot layout
-            num_primal = 4  # Number of primal variables
-            num_dual = len(dual_inequality_indices) + len(dual_equality_indices)  # Number of dual variables
-            total_plots = num_primal + num_dual
-            
-            # Calculate grid size
-            cols = 4
-            rows = -(-total_plots // cols)  # Ceiling division
-
-            # Create unified plot
-            fig, axes = plt.subplots(rows, cols, figsize=(20, 5 * rows))
-            axes = axes.flatten()
-
-            fig.suptitle("Comparison of known vs predicted decision variables of the first training sample", fontsize=16)
-
-            # Plot primal variables
-            primal_plots = [
-                (lineflow_indices, 'Lineflow'),
-                (gen_prod_indices, 'Generation Production'),
-                (missed_demand_indices, 'Missed Demand'),
-                (units_invested_indices, 'Units Invested')
-            ]
-
-            for i, (indices, label) in enumerate(primal_plots):
-                ax = axes[i]
-                
-                # Extract values for predictions and targets
-                predictions = Y[0, indices].cpu().numpy() if torch.is_tensor(Y) else Y[0, indices]
-                targets = Y_target[0, indices].cpu().numpy() if torch.is_tensor(Y_target) else Y_target[0, indices]
-                
-                # Plot the data
-                ax.plot(predictions, label=f'{label} Predictions', marker='o')
-                ax.plot(targets, label=f'{label} Targets', marker='x')
-                
-                # Annotate the points with values
-                for j, (pred, targ) in enumerate(zip(predictions, targets)):
-                    ax.text(j, pred, f'{pred:.2f}', color='blue', fontsize=8, ha='center', va='bottom')
-                    ax.text(j, targ, f'{targ:.2f}', color='orange', fontsize=8, ha='center', va='top')
-                
-                # Set labels and title
-                ax.set_title(f'Comparison of {label}')
-                ax.set_xlabel('Index')
-                ax.set_ylabel('Values')
-                ax.legend()
-                ax.grid(True)
-
-            # Plot dual variables
-            dual_plots = dual_inequality_indices + dual_equality_indices
-
-            for i, (indices, label) in enumerate(dual_plots, start=num_primal):
-                ax = axes[i]
-                
-                # Extract differences for dual variables
-                predictions = mu[0, indices].cpu().numpy() if label.startswith('mu') else lamb[0, indices].cpu().numpy()
-                targets = mu_target[0, indices].cpu().numpy() if label.startswith('mu') else lamb_target[0, indices].cpu().numpy()
-                
-                # Plot the data
-                ax.plot(predictions, label=f'{label} Predictions', marker='o')
-                ax.plot(targets, label=f'{label} Targets', marker='x')
-                
-                # Annotate the points with values
-                for j, (pred, targ) in enumerate(zip(predictions, targets)):
-                    ax.text(j, pred, f'{pred:.2f}', color='blue', fontsize=8, ha='center', va='bottom')
-                    ax.text(j, targ, f'{targ:.2f}', color='orange', fontsize=8, ha='center', va='top')
-                
-                # Set labels and title
-                ax.set_title(f'Comparison of {label}')
-                ax.set_xlabel('Index')
-                ax.set_ylabel('Values')
-                ax.legend()
-                ax.grid(True)
-
-            # Hide unused subplots
-            for j in range(total_plots, len(axes)):
-                axes[j].axis('off')
-
-            plt.tight_layout()
-            plt.show()
-    
     
         
 class PrimalDualTrainer():
@@ -347,7 +236,7 @@ class PrimalDualTrainer():
         # self.test_loader = DataLoader(self.test_dataset, batch_size=len(self.test_dataset))
 
         # self.primal_net = PrimalNet(self.data, self.hidden_sizes).to(dtype=DTYPE, device=DEVICE)
-        self.primal_net = PrimalNetEndToEnd(self.data, self.hidden_sizes).to(dtype=DTYPE, device=DEVICE)
+        self.primal_net = PrimalNetEndToEnd(self.data).to(dtype=DTYPE, device=DEVICE)
         # self.primal_net = PrimalCNNNet(self.data, [4, 8]).to(dtype=DTYPE, device=DEVICE)
         # self.primal_net = PrimalGCNNet(self.data, self.hidden_sizes).to(dtype=DTYPE, device=DEVICE)
         # dual_net = DualNetTwoOutputLayers(data, hidden_size).to(dtype=DTYPE, device=DEVICE)
@@ -900,6 +789,7 @@ class FeedForwardNet(nn.Module):
 
         # Create layers dynamically based on the provided hidden_sizes
         for idx, (in_size, out_size) in enumerate(zip(layer_sizes[:-1], layer_sizes[1:])):
+            layers.append(nn.LayerNorm(in_size))
             layers.append(nn.Linear(in_size, out_size))
             # Add ReLU only if it is not the last layer
             if idx < len(layer_sizes) - 2:  # The last layer does not need ReLU
@@ -961,22 +851,18 @@ class EstimateSlackLayer(nn.Module):
         # Compute md_n,t
         md_nt = D_nt - (p_nt + net_flow_nt)  # [B, N, T]
 
-        p_nt.shape
-        net_flow_nt.shape
-        D_nt.shape
-
         return md_nt
 
 class PrimalNetEndToEnd(nn.Module):
         # TODO! Validate the repair layers in a jupyter notebook!
-        def __init__(self, data, hidden_sizes):
+        def __init__(self, data, n_size_factor=1.5, n_layers=4):
             super().__init__()
             self._data = data
-            self._hidden_sizes = hidden_sizes
+            self._hidden_sizes = [int(n_size_factor*data.xdim)] * n_layers
 
             self._out_dim = data.n_prod_vars + data.n_line_vars
 
-            self.feed_forward = FeedForwardNet(data.xdim, hidden_sizes, output_dim=data.n_prod_vars+data.n_line_vars)
+            self.feed_forward = FeedForwardNet(data.xdim, self._hidden_sizes, output_dim=data.n_prod_vars+data.n_line_vars)
             self.bound_repair_layer = BoundRepairLayer()
             # self.ramping_repair_layer = RampingRepairLayer()
 

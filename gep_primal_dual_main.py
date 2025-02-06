@@ -5,8 +5,10 @@ from gep_config_parser import *
 from data_wrangling import dataframe_to_dict
 
 from primal_dual import PrimalDualTrainer
-from gep_problem_refactored import GEPProblemSet
+from gep_problem import GEPProblemSet
 from gep_problem_operational import GEPOperationalProblemSet
+from get_gurobi_vars import OptValueExtractor
+from gep_main import run_model_no_bounds as run_Gurobi_no_bounds
 
 CONFIG_FILE_NAME        = "config.toml"
 VISUALIZATION_FILE_NAME = "visualization.toml"
@@ -29,7 +31,7 @@ def scale_dict(data_dict, scale_factor):
     return {key: value * scale_factor for key, value in data_dict.items()}
 
 
-def prep_data(inputs, N=None, G=None, L=None, train=0.8, valid=0.1, test=0.1, scale=True, sample_duration=12, constant_gen_inv=False):
+def prep_data(args, inputs, N=None, G=None, L=None, train=0.8, valid=0.1, test=0.1, scale=True, sample_duration=12, constant_gen_inv=False):
     print("Wrangling the input data")
 
     # Extract sets
@@ -124,7 +126,7 @@ def prep_data(inputs, N=None, G=None, L=None, train=0.8, valid=0.1, test=0.1, sc
 
     print("Creating problem instance")
     if constant_gen_inv:
-        data = GEPOperationalProblemSet(T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, sample_duration=sample_duration, train=train, valid=valid, test=test)
+        data = GEPOperationalProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, sample_duration=sample_duration, train=train, valid=valid, test=test)
     else:
         data = GEPProblemSet(T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, sample_duration=sample_duration, train=train, valid=valid, test=test)
 
@@ -135,6 +137,7 @@ def run_PDL(data, args, save_dir):
     print("Training the PDL")
     trainer = PrimalDualTrainer(data, args, save_dir)
     primal_net, dual_net, stats = trainer.train_PDL()
+    return primal_net, dual_net
 
 if __name__ == "__main__":
     import json
@@ -165,11 +168,40 @@ if __name__ == "__main__":
                 os.makedirs(save_dir)
             with open(os.path.join(save_dir, 'args.dict'), 'wb') as f:
                 pickle.dump(args, f)
-            
-            # Prep proble data:
-            data = prep_data(experiment_instance, N=args["N"], G=args["G"], L=args["L"], train=args["train"], valid=args["valid"], test=args["test"], scale=args["scale_problem"], sample_duration=args["sample_duration"], constant_gen_inv=args["operational"])
+
+        # Prep proble data:
+        data = prep_data(args, experiment_instance, N=args["N"], G=args["G"], L=args["L"], train=args["train"], valid=args["valid"], test=args["test"], scale=args["scale_problem"], sample_duration=args["sample_duration"], constant_gen_inv=args["operational"])
+
+        target_path = f"outputs/Gurobi/{args['G']}-OPT_TARGETS_T={args['sample_duration']}"
+
+        if not os.path.exists(target_path):
+            extractor = OptValueExtractor(args["operational"])
+            for t in data.time_ranges:
+                model, solver, time_taken = run_Gurobi_no_bounds(experiment_instance,
+                            t,
+                            data.N,
+                            data.G,
+                            data.L,
+                            data.pDemand,
+                            data.pGenAva,
+                            data.pVOLL,
+                            data.pWeight,
+                            data.pRamping,
+                            data.pInvCost,
+                            data.pVarCost,
+                            data.pUnitCap,
+                            data.pExpCap,
+                            data.pImpCap,
+                            )
+                extractor.extract_values(model)
+
+            with open(os.path.join("outputs/Gurobi", f"{args['G']}-OPT_TARGETS_T={args['sample_duration']}"), 'wb') as f:
+                pickle.dump(extractor.opt_targets, f)
+                
+            data.load_targets(target_path)
 
             # Run PDL
-            run_PDL(data, args, save_dir)
+            primal_net, dual_net = run_PDL(data, args, save_dir)
 
-
+            data.plot_balance(primal_net, dual_net)
+            data.plot_decision_variable_diffs(primal_net, dual_net)
