@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 class GEPOperationalProblemSet():
 
-    def __init__(self, args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, sample_duration=12, train=0.8, valid=0.1, test=0.1):
+    def __init__(self, args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, target_path):
         # ! Assume y = [p_{g,t}, f_{l,t}, md_{n,t}, ui_g]
         # Parameter for ui_g
         # self.pUnitInvestment = [4130.05009001755, 11232.550865341998] # BEL/GER, SunPV
@@ -15,6 +15,14 @@ class GEPOperationalProblemSet():
         self.DTYPE = torch.float64
         self.DEVICE = torch.device="cpu"
         torch.set_default_dtype(self.DTYPE)
+
+        # Args:
+        self.args = args
+        self.sample_duration = args["sample_duration"]
+        self.train = args["train"]
+        self.valid = args["valid"]
+        self.test = args["test"]
+
 
         # Input Sets
         self.T = T
@@ -46,27 +54,21 @@ class GEPOperationalProblemSet():
         self.n_eq_per_t = self.num_n
 
         # Number of timesteps per data sample
-        assert (float(len(T)) / sample_duration).is_integer() # Total number of timesteps should be divisible by the number of timesteps per data sample.
-        self.sample_duration = sample_duration
+        assert (float(len(T)) / self.sample_duration).is_integer() # Total number of timesteps should be divisible by the number of timesteps per data sample.
 
         # Time slices, each slice makes a different sample.
-        self.time_ranges = [range(i, i + sample_duration, 1) for i in range(1, len(T), sample_duration)]
+        self.time_ranges = [range(i, i + self.sample_duration, 1) for i in range(1, len(T), self.sample_duration)]
 
-        self.neq = self.n_eq_per_t * sample_duration
-        self.nineq = self.n_ineq_per_t * sample_duration
-        self.n_prod_vars = self.num_g * sample_duration
-        self.n_line_vars = self.num_l * sample_duration
-        self.n_md_vars = self.num_n * sample_duration
+        self.neq = self.n_eq_per_t * self.sample_duration
+        self.nineq = self.n_ineq_per_t * self.sample_duration
+        self.n_prod_vars = self.num_g * self.sample_duration
+        self.n_line_vars = self.num_l * self.sample_duration
+        self.n_md_vars = self.num_n * self.sample_duration
         self.ydim = self.n_prod_vars + self.n_line_vars + self.n_md_vars
 
-        # Known optimal values from Gurobi.
-        # file_path = f"outputs/Gurobi/OPERATIONAL={True}_GEP_OPT_TARGETS_T={self.sample_duration}"
-        # ! BEL, GER, only Gas generators
-        # file_path = f"outputs/Gurobi/BEL_GER_GAS-OPERATIONAL=True-GEP_OPT_TARGETS_T=12"
-        # ! BEL, GER, only Sun generators
-        # file_path = "outputs/Gurobi/BEL_GER_SUN-OPERATIONAL=True-GEP_OPT_TARGETS_T=24"
-        # ! BEL, GER, Sun and Gas generators
-        # file_path = "outputs/Gurobi/BEL_GER_SUN_GAS-OPERATIONAL=True-GEP_OPT_TARGETS_T=24"
+        
+        self._opt_targets = self.load_targets(target_path)
+        self.pUnitInvestment = self._opt_targets["y_investment"]
 
         # Masks for node balance!
         # Initialize mask
@@ -100,7 +102,7 @@ class GEPOperationalProblemSet():
         self.xdim = self.X.shape[1]
 
         # Split x into training, val, test sets.
-        self._split_X_in_sets(train, valid, test)
+        self._split_X_in_sets(self.train, self.valid, self.test)
 
         self.md_indices = self.get_md_nt_indices()
     
@@ -117,9 +119,8 @@ class GEPOperationalProblemSet():
 
     def load_targets(self, target_path):
         with open(target_path, 'rb') as file:
-            self._opt_targets = pickle.load(file)
-        
-        self.pUnitInvestment = self._opt_targets["y_investment"]
+            return pickle.load(file)
+
 
     def get_md_nt_indices(self):
         indices = []

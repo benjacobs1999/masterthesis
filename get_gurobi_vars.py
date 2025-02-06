@@ -76,12 +76,9 @@ class OptValueExtractor:
         """Extracts dual variables with time-first ordering: [c0t0, c1t0, c0t1, c1t1, ...]"""
         
         # Define constraints based on whether generator investment is constant
-        if self.constant_gen_inv:
-            ineq_constraints = [
-                model.eGenProdPositive, model.eMaxProd, model.eLineFlowLB, model.eLineFlowUB, model.eMissedDemandPositive, model.eMissedDemandLeqDemand, model.eGenInvPositive
-            ]  # First vLineFlow = lower bound, second is upper bound.
-        else:
-            raise NotImplementedError("This method needs to be implemented for non-fixed investment variables")
+        ineq_constraints = [
+            model.eGenProdPositive, model.eMaxProd, model.eLineFlowLB, model.eLineFlowUB, model.eMissedDemandPositive, model.eMissedDemandLeqDemand, model.eGenInvPositive
+        ]  # First vLineFlow = lower bound, second is upper bound.
 
         # Equality constraints
         eq_constraints = [model.eNodeBal]
@@ -183,9 +180,6 @@ if __name__ == "__main__":
 
         # Run Gurobi
         # experiment_instance, t, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap
-        opt_objs_train = []
-        opt_vars = []
-        opt_dual_vars = []
         extractor = OptValueExtractor(args["operational"])
         for t in data.time_ranges:
             model, solver, time_taken = run_Gurobi_no_bounds(experiment_instance,
