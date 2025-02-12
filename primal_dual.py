@@ -2,14 +2,12 @@ import copy
 import os
 import pickle
 import time
-# from setproctitle import setproctitle
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
-import matplotlib.pyplot as plt
-# import torch_geometric
+import torch_geometric
 
 DTYPE = torch.float64
 DEVICE = torch.device="cpu"

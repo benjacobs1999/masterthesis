@@ -31,11 +31,14 @@ def scale_dict(data_dict, scale_factor):
     return {key: value * scale_factor for key, value in data_dict.items()}
 
 
-def prep_data(args, inputs, N=None, G=None, L=None, train=0.8, valid=0.1, test=0.1, scale=True, sample_duration=12, constant_gen_inv=False):
+def prep_data(args, inputs, target_path):
     print("Wrangling the input data")
 
     # Extract sets
     T = inputs["times"] # [1, 2, 3, ... 8760] ---> 8760
+    N = args["N"]
+    G = args["G"]
+    L = args["L"]
 
     if not (N or G or L):
         G = inputs["generators"] # [('Country1', 'EnergySource1'), ...] ---> 107
@@ -65,7 +68,7 @@ def prep_data(args, inputs, N=None, G=None, L=None, train=0.8, valid=0.1, test=0
 
     # WOP
     # Scale inversely proportional to times (T)
-    pWeight = inputs["representative_period_weight"] / (sample_duration / 8760)
+    pWeight = inputs["representative_period_weight"] / (args["sample_duration"] / 8760)
 
     pRamping = inputs["ramping_value"]
 
@@ -101,7 +104,7 @@ def prep_data(args, inputs, N=None, G=None, L=None, train=0.8, valid=0.1, test=0
         value="ImpCap_MW"
     )
 
-    if scale:
+    if args["scale_problem"]:
         pDemand = scale_dict(pDemand, SCALE_FACTORS["pDemand"])
         pGenAva = scale_dict(pGenAva, SCALE_FACTORS["pGenAva"])
         pVOLL *= SCALE_FACTORS["pVOLL"]
@@ -123,12 +126,38 @@ def prep_data(args, inputs, N=None, G=None, L=None, train=0.8, valid=0.1, test=0
     pExpCap = dict(sorted(pExpCap.items()))
     pImpCap = dict(sorted(pImpCap.items()))
 
+    time_ranges = [range(i, i + args["sample_duration"], 1) for i in range(1, len(T), args["sample_duration"])]
+
+    if not os.path.exists(target_path):
+        extractor = OptValueExtractor(args["operational"])
+        for t in time_ranges:
+            model, solver, time_taken = run_Gurobi_no_bounds(experiment_instance,
+                        t,
+                        N,
+                        G,
+                        L,
+                        pDemand,
+                        pGenAva,
+                        pVOLL,
+                        pWeight,
+                        pRamping,
+                        pInvCost,
+                        pVarCost,
+                        pUnitCap,
+                        pExpCap,
+                        pImpCap,
+                        )
+            extractor.extract_values(model)
+
+        with open(target_path, 'wb') as f:
+            pickle.dump(extractor.opt_targets, f)
+
 
     print("Creating problem instance")
-    if constant_gen_inv:
-        data = GEPOperationalProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, sample_duration=sample_duration, train=train, valid=valid, test=test)
+    if args["operational"]:
+        data = GEPOperationalProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, target_path=target_path)
     else:
-        data = GEPProblemSet(T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, sample_duration=sample_duration, train=train, valid=valid, test=test)
+        data = GEPProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, target_path=target_path)
 
     return data
 
@@ -169,39 +198,13 @@ if __name__ == "__main__":
             with open(os.path.join(save_dir, 'args.dict'), 'wb') as f:
                 pickle.dump(args, f)
 
-        # Prep problem data:
-        data = prep_data(args, experiment_instance, N=args["N"], G=args["G"], L=args["L"], train=args["train"], valid=args["valid"], test=args["test"], scale=args["scale_problem"], sample_duration=args["sample_duration"], constant_gen_inv=args["operational"])
+            target_path = f"outputs/Gurobi/Operational={args['operational']}_T={args['sample_duration']}_{args['G']}"
 
-        # target_path = f"outputs/Gurobi/{args['G']}-OPT_TARGETS_T={args['sample_duration']}"
+            # Prep proble data:
+            data = prep_data(args=args, inputs=experiment_instance, target_path=target_path)
 
-        # if not os.path.exists(target_path):
-        #     extractor = OptValueExtractor(args["operational"])
-        #     for t in data.time_ranges:
-        #         model, solver, time_taken = run_Gurobi_no_bounds(experiment_instance,
-        #                     t,
-        #                     data.N,
-        #                     data.G,
-        #                     data.L,
-        #                     data.pDemand,
-        #                     data.pGenAva,
-        #                     data.pVOLL,
-        #                     data.pWeight,
-        #                     data.pRamping,
-        #                     data.pInvCost,
-        #                     data.pVarCost,
-        #                     data.pUnitCap,
-        #                     data.pExpCap,
-        #                     data.pImpCap,
-        #                     )
-        #         extractor.extract_values(model)
+            # # Run PDL
+            # primal_net, dual_net = run_PDL(data, args, save_dir)
 
-        #     with open(os.path.join("outputs/Gurobi", f"{args['G']}-OPT_TARGETS_T={args['sample_duration']}"), 'wb') as f:
-        #         pickle.dump(extractor.opt_targets, f)
-                
-        #     data.load_targets(target_path)
-
-        #     # Run PDL
-        #     primal_net, dual_net = run_PDL(data, args, save_dir)
-
-        #     data.plot_balance(primal_net, dual_net)
-        #     data.plot_decision_variable_diffs(primal_net, dual_net)
+            # data.plot_balance(primal_net, dual_net)
+            # data.plot_decision_variable_diffs(primal_net, dual_net)
