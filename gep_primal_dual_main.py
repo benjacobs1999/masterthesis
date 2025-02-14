@@ -7,8 +7,7 @@ from data_wrangling import dataframe_to_dict
 from primal_dual import PrimalDualTrainer
 from gep_problem import GEPProblemSet
 from gep_problem_operational import GEPOperationalProblemSet
-from get_gurobi_vars import OptValueExtractor
-from gep_main import run_model_no_bounds as run_Gurobi_no_bounds
+from get_gurobi_vars import save_opt_targets
 
 CONFIG_FILE_NAME        = "config.toml"
 VISUALIZATION_FILE_NAME = "visualization.toml"
@@ -129,28 +128,7 @@ def prep_data(args, inputs, target_path):
     time_ranges = [range(i, i + args["sample_duration"], 1) for i in range(1, len(T), args["sample_duration"])]
 
     if not os.path.exists(target_path):
-        extractor = OptValueExtractor(args["operational"])
-        for t in time_ranges:
-            model, solver, time_taken = run_Gurobi_no_bounds(experiment_instance,
-                        t,
-                        N,
-                        G,
-                        L,
-                        pDemand,
-                        pGenAva,
-                        pVOLL,
-                        pWeight,
-                        pRamping,
-                        pInvCost,
-                        pVarCost,
-                        pUnitCap,
-                        pExpCap,
-                        pImpCap,
-                        )
-            extractor.extract_values(model)
-
-        with open(target_path, 'wb') as f:
-            pickle.dump(extractor.opt_targets, f)
+        save_opt_targets(args, experiment_instance, target_path, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, time_ranges)
 
 
     print("Creating problem instance")
