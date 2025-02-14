@@ -19,4 +19,3 @@ To create an environment with the correct packages, type the following commands 
 - `gep_problem.py`: Class creating GEP problem instances
 - `get_gurobi_vars.py`: Class for extracting optimal primal and dual variables from Gurobi
 - `primal_dual.py`: Class with PDL (and all deep learning) code.
-
