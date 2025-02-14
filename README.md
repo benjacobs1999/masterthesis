@@ -3,7 +3,7 @@
 ### Environment
 To create an environment with the correct packages, type the following commands in the terminal:
 
-1. `conda create -n {env_name} python=3.9`
+1. `conda create -n {env_name} python=3.9.20`
 2. `conda activate {env_name}`
 3. `pip install -r requirements.txt`
 
@@ -19,4 +19,3 @@ To create an environment with the correct packages, type the following commands 
 - `gep_problem.py`: Class creating GEP problem instances
 - `get_gurobi_vars.py`: Class for extracting optimal primal and dual variables from Gurobi
 - `primal_dual.py`: Class with PDL (and all deep learning) code.
-
