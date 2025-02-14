@@ -182,7 +182,7 @@ if __name__ == "__main__":
             data = prep_data(args=args, inputs=experiment_instance, target_path=target_path)
 
             # # Run PDL
-            primal_net, dual_net = run_PDL(data, args, save_dir)
+            # primal_net, dual_net = run_PDL(data, args, save_dir)
 
-            data.plot_balance(primal_net, dual_net)
-            data.plot_decision_variable_diffs(primal_net, dual_net)
+            # data.plot_balance(primal_net, dual_net)
+            # data.plot_decision_variable_diffs(primal_net, dual_net)
