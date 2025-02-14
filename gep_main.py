@@ -572,9 +572,9 @@ if __name__ == "__main__":
         T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap = prep_data(experiment_instance, N=args["N"], G=args["G"], L=args["L"])
 
         T_ranges = [range(i, i + SAMPLE_DURATION, 1) for i in range(1, len(T), SAMPLE_DURATION)]
-        for t in T_ranges[:1]:
+        for t in T_ranges[:2]:
             # Run one experiment for j repeats
             model, solver, time_taken = run_model_no_bounds(experiment_instance, t, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
             # print(get_variable_values_as_list(model.vGenInv))
-            # print(f"Operating costs: {model.vOpeCost.value}")
+            print(f"Operating costs: {model.vOpeCost.value}")
     
