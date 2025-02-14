@@ -1,11 +1,27 @@
-{   
-    "N": ["BEL", "GER"],
-    "G": [["BEL", "SunPV"], ["GER", "SunPV"]],
-    "L": [["BEL", "GER"]],
-    "operational": false,
+{
+    "N": [
+        "BEL",
+        "GER"
+    ],
+    "G": [
+        [
+            "BEL",
+            "SunPV"
+        ],
+        [
+            "GER",
+            "SunPV"
+        ]
+    ],
+    "L": [
+        [
+            "BEL",
+            "GER"
+        ]
+    ],
+    "operational": true,
     "sample_duration": 24,
     "scale_problem": true,
-
     "outer_iterations": 10,
     "inner_iterations": 1000,
     "tau": 0.8,
@@ -13,7 +29,10 @@
     "rho_max": 5000,
     "alpha": 10,
     "batch_size": 100,
-    "hidden_sizes": [500, 500],
+    "hidden_sizes": [
+        500,
+        500
+    ],
     "primal_lr": 1e-4,
     "dual_lr": 1e-4,
     "decay": 0.99,
