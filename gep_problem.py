@@ -197,11 +197,22 @@ class GEPProblemSet():
     def eq_resid(self, Y, eq_cm, eq_rhs):
         torch.bmm(eq_cm, Y.unsqueeze(-1)).squeeze(-1)
         return torch.bmm(eq_cm, Y.unsqueeze(-1)).squeeze(-1) - eq_rhs
+    
+    #! Enforce this with a ReLU.
+    def dual_ineq_resid(self, mu, lamb):
+        """Dual inequality Residual, takes on the form:
+            -mu <= 0
+        """
+        return -mu
+
+    def dual_eq_resid(self, mu, lamb, eq_cm, ineq_cm):
+        """Dual equality Residual, takes on the form:
+            G^T \mu + H^T \lambda + c = 0"""
+        return torch.bmm(ineq_cm.transpose(1, 2), mu) + torch.bmm(eq_cm.transpose(1, 2), lamb) + self.obj_coeff
 
     def obj_fn(self, Y):
         # obj_coeff does not need batching, objective is the same over different samples.
-
-        return self.pWeight * self.obj_coeff @ Y.T
+        return self.obj_coeff @ Y.T
     
     def dual_obj_fn(self, eq_rhs, ineq_rhs, mu, lamb):
         # Batched dot product
@@ -224,24 +235,28 @@ class GEPProblemSet():
                          p_{g,tn}, f_{l,tn}, md_{n,tn}] """
 
         # coeff vector of zero's to be filled
-        c = torch.zeros(self.num_g + self.n_var_per_t*self.sample_duration, dtype=torch.float64)
-
-        for g_idx, g in enumerate(self.G):
-            c[g_idx] = self.pInvCost[g] * self.pUnitCap[g]
+        c = torch.zeros(self.n_var_per_t*self.sample_duration, dtype=torch.float64)
 
         for t in range(self.sample_duration):
             # Sum over G,T (PC_g * p_{g,t}) --> Generation costs
             for idx_g, g in enumerate(self.G):
                 # Generator variables are always at first |G| indices per timestep
                 coeff_idx = t * self.n_var_per_t + idx_g
-                c[coeff_idx] = self.pVarCost[g]
+                c[coeff_idx] = self.pWeight * self.pVarCost[g]
 
             # Sum over N,T (MDC * md_{n,t}) --> Cost missed demand
             for idx_n in range(self.num_n):
                 # Missed demand variables come after generator and lineflow variables
+                # First num_g comes from the ui_g at the start.
                 coeff_idx = t * self.n_var_per_t + self.num_g + self.num_l + idx_n
-                c[coeff_idx] = self.pVOLL
-
+                c[coeff_idx] = self.pWeight * self.pVOLL
+        
+        c_inv = torch.zeros(self.num_g)
+        for g_idx, g in enumerate(self.G):
+            c_inv[g_idx] = self.pInvCost[g] * self.pUnitCap[g]
+        
+        c = torch.concat([c_inv, c])
+        
         return c
 
     def build_X(self,):
@@ -328,7 +343,6 @@ class GEPProblemSet():
                 # GA_{g,t} * UCAP_g * ui_g
                 ineq_cm[row_idx, idx_g] = -(self.pGenAva.get((*g, t), 1.0) * self.pUnitCap[g])
             row_offset += num_rows_per_t
-
 
         ineq_rhs = []
         # Create right hand side:

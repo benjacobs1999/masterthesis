@@ -66,7 +66,6 @@ class GEPOperationalProblemSet():
         self.n_md_vars = self.num_n * self.sample_duration
         self.ydim = self.n_prod_vars + self.n_line_vars + self.n_md_vars
 
-        
         self._opt_targets = self.load_targets(target_path)
         self.pUnitInvestment = self._opt_targets["y_investment"]
 
@@ -211,9 +210,25 @@ class GEPOperationalProblemSet():
     def ineq_resid(self, Y, ineq_cm, ineq_rhs):
         return torch.bmm(ineq_cm, Y.unsqueeze(-1)).squeeze(-1) - ineq_rhs
 
+    def ineq_dist(self, Y, ineq_cm, ineq_rhs):
+        resids = self.ineq_resid(Y, ineq_cm, ineq_rhs)
+        return torch.clamp(resids, 0)
+
     def eq_resid(self, Y, eq_cm, eq_rhs):
         torch.bmm(eq_cm, Y.unsqueeze(-1)).squeeze(-1)
-        return torch.bmm(eq_cm, Y.unsqueeze(-1)).squeeze(-1) - eq_rhs
+        return eq_rhs - torch.bmm(eq_cm, Y.unsqueeze(-1)).squeeze(-1)
+    
+        #! Enforce this with a ReLU.
+    def dual_ineq_resid(self, mu, lamb):
+        """Dual inequality Residual, takes on the form:
+            -mu <= 0
+        """
+        return -mu
+
+    def dual_eq_resid(self, mu, lamb, eq_cm, ineq_cm):
+        """Dual equality Residual, takes on the form:
+            G^T \mu + H^T \lambda + c = 0"""
+        return self.obj_coeff - (torch.bmm(eq_cm.transpose(1, 2), lamb.unsqueeze(-1)).squeeze(-1) - torch.bmm(ineq_cm.transpose(1, 2), mu.unsqueeze(-1)).squeeze(-1))
 
     def obj_fn(self, Y):
         # obj_coeff does not need batching, objective is the same over different samples.
@@ -221,7 +236,7 @@ class GEPOperationalProblemSet():
         # Take the absolute value of the missed demand in the obj function to penalize negative missed demand
         Y = Y.clone()
         Y[:, self.md_indices] = Y[:, self.md_indices].abs()
-        return self.pWeight * self.obj_coeff @ Y.T
+        return self.obj_coeff @ Y.T
     
     def dual_obj_fn(self, eq_rhs, ineq_rhs, mu, lamb):
         # Batched dot product
@@ -230,11 +245,8 @@ class GEPOperationalProblemSet():
         # Batched dot product
         eq_term = torch.sum(lamb * eq_rhs, dim=1)
 
-        return -(ineq_term + eq_term)
-    
-    def ineq_dist(self, Y, ineq_cm, ineq_rhs):
-        resids = self.ineq_resid(Y, ineq_cm, ineq_rhs)
-        return torch.clamp(resids, 0)
+        return eq_term - ineq_term
+        # return (ineq_term + eq_term)
     
     def build_obj_coeff(self,):
         """ Builds the objective function coefficients (only the operating costs)
@@ -495,15 +507,14 @@ class GEPOperationalProblemSet():
     def plot_decision_variable_diffs(self, primal_net, dual_net):
         with torch.no_grad():
             Y = primal_net(self.X[self.train_indices], self.eq_rhs[self.train_indices], self.ineq_rhs[self.train_indices])
-            Y_target = self.opt_targets["y"][self.train_indices]
+            Y_target = self.opt_targets["y_operational"][self.train_indices]
 
-            mu, lamb = dual_net(self.X[self.train_indices])
-            mu_target = self.opt_targets["mu"][self.train_indices]
-            lamb_target = self.opt_targets["lamb"][self.train_indices]
+            mu, lamb = dual_net(self.X[self.train_indices], self.eq_cm[self.train_indices])
+            mu_target = self.opt_targets["mu_operational"][self.train_indices]
+            lamb_target = self.opt_targets["lamb_operational"][self.train_indices]
             
-            # Extract decision variables
-            p_gt, f_lt, md_nt = self.split_dec_vars_from_Y(Y)  # [B, (G|L|N), T]
-            p_gt_target, f_lt_target, md_nt_target = self.split_dec_vars_from_Y(Y_target)  # [B, (G|L|N), T]
+            p_gt, f_lt, md_nt = self.split_dec_vars_from_Y(Y)  
+            p_gt_target, f_lt_target, md_nt_target = self.split_dec_vars_from_Y(Y_target)  
 
             dual_lb_p, dual_ub_p, dual_lb_f, dual_ub_f, dual_lb_md, dual_ub_md = self.split_ineq_constraints(mu)
             dual_target_lb_p, dual_target_ub_p, dual_target_lb_f, dual_target_ub_f, dual_target_lb_md, dual_target_ub_md = self.split_ineq_constraints(mu_target)
@@ -513,9 +524,8 @@ class GEPOperationalProblemSet():
 
             num_gens, num_lines, num_nodes, num_timesteps = p_gt.shape[1], f_lt.shape[1], md_nt.shape[1], p_gt.shape[2]
             
-            fig, axes = plt.subplots(3, 4, figsize=(24, 12), sharex=False)
+            fig, axes = plt.subplots(2, 4, figsize=(24, 12), sharex=False)
             
-            # Define x positions
             x_pos_g = np.arange(num_timesteps * num_gens)
             x_labels_g = [f"T{t}_G{g}" for g in range(num_gens) for t in range(num_timesteps)]
             x_pos_l = np.arange(num_timesteps * num_lines)
@@ -523,14 +533,12 @@ class GEPOperationalProblemSet():
             x_pos_n = np.arange(num_timesteps * num_nodes)
             x_labels_n = [f"T{t}_N{n}" for n in range(num_nodes) for t in range(num_timesteps)]
             
-            # Set column titles
             column_titles = ["Generation Production", "Line Flows", "Missed Demand", "Node Balance Duals"]
             for col, title in enumerate(column_titles):
                 axes[0, col].set_title(title, fontsize=14)
             
-            # Plot primal and dual variables
             def plot_variable(ax, x_pos, labels, pred, target, ylabel, color):
-                ax.bar(x_pos, pred, label='Predicted', color=color, alpha=0.6)
+                ax.bar(x_pos, pred, label='Predicted', color=color, alpha=0.5)
                 ax.scatter(x_pos, target, color='red', label='Target', zorder=3)
                 ax.set_ylabel(ylabel)
                 ax.set_xticks(x_pos)
@@ -539,24 +547,29 @@ class GEPOperationalProblemSet():
                 ax.axhline(0, color='black', linewidth=2)
                 ax.grid(True)
             
-            # First row: Primal variables
-        plot_variable(axes[0, 0], x_pos_g, x_labels_g, p_gt[0].reshape(-1), p_gt_target[0].reshape(-1), 'Primal Generation', 'blue')
-        plot_variable(axes[0, 1], x_pos_l, x_labels_l, f_lt[0].reshape(-1), f_lt_target[0].reshape(-1), 'Primal Line Flow', 'green')
-        plot_variable(axes[0, 2], x_pos_n, x_labels_n, md_nt[0].reshape(-1), md_nt_target[0].reshape(-1), 'Primal Missed Demand', 'orange')
-        
-        # Second row: Lower bound duals (each column has its own x-axis)
-        plot_variable(axes[1, 0], x_pos_g, x_labels_g, dual_lb_p[0].reshape(-1), dual_target_lb_p[0].reshape(-1), 'Dual LB (Gen)', 'purple')
-        plot_variable(axes[1, 1], x_pos_l, x_labels_l, dual_lb_f[0].reshape(-1), dual_target_lb_f[0].reshape(-1), 'Dual LB (Flow)', 'purple')
-        plot_variable(axes[1, 2], x_pos_n, x_labels_n, dual_lb_md[0].reshape(-1), dual_target_lb_md[0].reshape(-1), 'Dual LB (Missed Demand)', 'purple')
-        plot_variable(axes[1, 3], x_pos_n, x_labels_n, dual_node_balance[0].reshape(-1), dual_node_balance_target[0].reshape(-1), 'Dual Node Balance', 'brown')
-        
-        # Third row: Upper bound duals (each column has its own x-axis)
-        plot_variable(axes[2, 0], x_pos_g, x_labels_g, dual_ub_p[0].reshape(-1), dual_target_ub_p[0].reshape(-1), 'Dual UB (Gen)', 'cyan')
-        plot_variable(axes[2, 1], x_pos_l, x_labels_l, dual_ub_f[0].reshape(-1), dual_target_ub_f[0].reshape(-1), 'Dual UB (Flow)', 'cyan')
-        plot_variable(axes[2, 2], x_pos_n, x_labels_n, dual_ub_md[0].reshape(-1), dual_target_ub_md[0].reshape(-1), 'Dual UB (Missed Demand)', 'cyan')
-        
-        plt.tight_layout()
-        plt.show()
+            plot_variable(axes[0, 0], x_pos_g, x_labels_g, p_gt[0].reshape(-1), p_gt_target[0].reshape(-1), 'Primal Generation', 'blue')
+            plot_variable(axes[0, 1], x_pos_l, x_labels_l, f_lt[0].reshape(-1), f_lt_target[0].reshape(-1), 'Primal Line Flow', 'green')
+            plot_variable(axes[0, 2], x_pos_n, x_labels_n, md_nt[0].reshape(-1), md_nt_target[0].reshape(-1), 'Primal Missed Demand', 'orange')
+            
+            def plot_dual_variable(ax, x_pos, labels, lb, ub, lb_target, ub_target, ylabel):
+                ax.bar(x_pos, lb, label='Dual LB', color='purple', alpha=0.5)
+                ax.bar(x_pos, ub, label='Dual UB', color='cyan', alpha=0.5)
+                ax.scatter(x_pos, lb_target, color='purple', marker='o', label='Target LB', zorder=3, edgecolors='black')
+                ax.scatter(x_pos, ub_target, color='cyan', marker='o', label='Target UB', zorder=2, edgecolors='black')
+                ax.set_ylabel(ylabel)
+                ax.set_xticks(x_pos)
+                ax.set_xticklabels(labels, rotation=90)
+                ax.legend()
+                ax.axhline(0, color='black', linewidth=2)
+                ax.grid(True)
+            
+            plot_dual_variable(axes[1, 0], x_pos_g, x_labels_g, dual_lb_p[0].reshape(-1), dual_ub_p[0].reshape(-1), dual_target_lb_p[0].reshape(-1), dual_target_ub_p[0].reshape(-1), 'Dual (Gen)')
+            plot_dual_variable(axes[1, 1], x_pos_l, x_labels_l, dual_lb_f[0].reshape(-1), dual_ub_f[0].reshape(-1), dual_target_lb_f[0].reshape(-1), dual_target_ub_f[0].reshape(-1), 'Dual (Flow)')
+            plot_dual_variable(axes[1, 2], x_pos_n, x_labels_n, dual_lb_md[0].reshape(-1), dual_ub_md[0].reshape(-1), dual_target_lb_md[0].reshape(-1), dual_target_ub_md[0].reshape(-1), 'Dual (Missed Demand)')
+            plot_variable(axes[1, 3], x_pos_n, x_labels_n, dual_node_balance[0].reshape(-1), dual_node_balance_target[0].reshape(-1), 'Dual Node Balance', 'brown')
+            
+            plt.tight_layout()
+            plt.show()
 
 
 
