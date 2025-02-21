@@ -19,7 +19,7 @@
             "GER"
         ]
     ],
-    "operational": true,
+    "operational": false,
     "sample_duration": 24,
     "scale_problem": true,
     "outer_iterations": 10,

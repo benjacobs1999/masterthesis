@@ -8,6 +8,9 @@ from data_wrangling import dataframe_to_dict
 from gep_problem import GEPProblemSet
 from gep_problem_operational import GEPOperationalProblemSet
 from get_gurobi_vars import save_opt_targets
+from gep_benders import solve_matrix_problem
+from gep_benders import solve_matrix_problem_simple
+from gep_benders import solve_with_benders
 
 CONFIG_FILE_NAME        = "config.toml"
 VISUALIZATION_FILE_NAME = "visualization.toml"
@@ -126,9 +129,9 @@ def prep_data(args, inputs, target_path):
     pImpCap = dict(sorted(pImpCap.items()))
 
     time_ranges = [range(i, i + args["sample_duration"], 1) for i in range(1, len(T), args["sample_duration"])]
-
-    if not os.path.exists(target_path):
-        save_opt_targets(args, experiment_instance, target_path, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, time_ranges)
+    
+    # if not os.path.exists(target_path):
+    #     save_opt_targets(args, experiment_instance, target_path, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, time_ranges)
 
 
     print("Creating problem instance")
@@ -178,7 +181,7 @@ if __name__ == "__main__":
 
             target_path = f"outputs/Gurobi/Operational={args['operational']}_T={args['sample_duration']}_{args['G']}"
 
-            # Prep proble data:
+            # Prep problem data:
             data = prep_data(args=args, inputs=experiment_instance, target_path=target_path)
 
             # # Run PDL
@@ -186,3 +189,12 @@ if __name__ == "__main__":
 
             # data.plot_balance(primal_net, dual_net)
             # data.plot_decision_variable_diffs(primal_net, dual_net)
+
+            # Solve single sample with matrix formulation
+            # sample = 0 # only solve first sample for now 
+            # solution = solve_matrix_problem(data, sample) # solution = Obj: 2374.99
+
+            # Solve single sample with Benders decomposition
+            sample = 0 # solution = Obj: 2374.99
+            solve_with_benders(data, sample)
+
