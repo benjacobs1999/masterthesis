@@ -2,7 +2,7 @@
     "N": ["BEL", "GER"],
     "G": [["BEL", "SunPV"], ["GER", "SunPV"]],
     "L": [["BEL", "GER"]],
-    "operational": false,
+    "operational": true,
     "sample_duration": 24,
     "scale_problem": true,
 
@@ -19,7 +19,7 @@
     "decay": 0.99,
     "patience": 10,
     "corrEps": 1e-4,
-    "train": 0.8,
-    "valid": 0.1,
-    "test": 0.1
+    "train": 0.004,
+    "valid": 0.004,
+    "test": 0.992
 }

@@ -169,7 +169,10 @@ class TensorBoardLogger():
             for name, param in primal_net.named_parameters():
                 if param.grad is not None:  # Skip parameters without gradients
                     self.writer.add_scalar(f"Gradients_primal/{name}", param.grad.norm().item(), step)
-            # self.writer.add_scalar(f"Gradient/dual", dual_net[-1].weight.grad.mean())
+            
+            for name, param in dual_net.named_parameters():
+                if param.grad is not None:  # Skip parameters without gradients
+                    self.writer.add_scalar(f"Gradients_dual/{name}", param.grad.norm().item(), step)
 
     def log_rho_vk(self, rho, v_k, step):
         self.writer.add_scalar(f"Rho_and_violation/rho", rho, step)
@@ -241,15 +244,14 @@ class PrimalDualTrainer():
         # self.valid_dataset = CustomDataset(X[valid].to(DEVICE), eq_cm[valid], ineq_cm[valid], eq_rhs[valid], ineq_rhs[valid])
         # self.test_dataset = TensorDataset(self.data.testX.to(DEVICE), self.data.testX_scaled.to(DEVICE))
 
-        # self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
-        self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=False)
+        self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
         # self.valid_loader = DataLoader(self.valid_dataset, batch_size=len(self.valid_dataset))
         # self.test_loader = DataLoader(self.test_dataset, batch_size=len(self.test_dataset))
 
         # self.primal_net = PrimalNet(self.data, self.hidden_sizes).to(dtype=DTYPE, device=DEVICE)
         self.primal_net = PrimalNetEndToEnd(self.data).to(dtype=DTYPE, device=DEVICE)
-        self.dual_net = DualNet(self.data, self.hidden_sizes, self.data.nineq, self.data.neq).to(dtype=DTYPE, device=DEVICE)
-        # self.dual_net = DualNetEndToEnd(self.data).to(dtype=DTYPE, device=DEVICE)
+        # self.dual_net = DualNet(self.data, self.hidden_sizes, self.data.nineq, self.data.neq).to(dtype=DTYPE, device=DEVICE)
+        self.dual_net = DualNetEndToEnd(self.data).to(dtype=DTYPE, device=DEVICE)
 
         self.primal_optim = torch.optim.Adam(self.primal_net.parameters(), lr=self.primal_lr)
         self.dual_optim = torch.optim.Adam(self.dual_net.parameters(), lr=self.dual_lr)
@@ -292,8 +294,6 @@ class PrimalDualTrainer():
                     # Compute average loss for the epoch
                     avg_train_loss = total_train_loss / num_batches
                     self.primal_scheduler.step(avg_train_loss)
-
-                    # Step optimizer with gradients accumulated over the epoch
 
                     # Logg training loss:
                     with torch.no_grad():
@@ -340,8 +340,8 @@ class PrimalDualTrainer():
                             mu_k, lamb_k = frozen_dual_net(Xtrain, train_eq_cm)
                             y = frozen_primal_net(Xtrain, train_eq_rhs, train_ineq_rhs)
                         # ! Test other loss!
-                        batch_loss = self.dual_loss(y, train_eq_cm, train_ineq_cm, train_eq_rhs, train_ineq_rhs, mu, lamb, mu_k, lamb_k).mean()
-                        # batch_loss = self.dual_loss_changed(y, train_eq_cm, train_ineq_cm, train_eq_rhs, train_ineq_rhs, mu, lamb, mu_k, lamb_k).mean()
+                        # batch_loss = self.dual_loss(y, train_eq_cm, train_ineq_cm, train_eq_rhs, train_ineq_rhs, mu, lamb, mu_k, lamb_k).mean()
+                        batch_loss = self.dual_loss_changed(y, train_eq_cm, train_ineq_cm, train_eq_rhs, train_ineq_rhs, mu, lamb, mu_k, lamb_k).mean()
                         batch_loss.backward()
                         self.dual_optim.step()
                         total_train_loss += batch_loss.item()
@@ -421,7 +421,8 @@ class PrimalDualTrainer():
         violation_eq = torch.sum(eq ** 2, dim=1)
         penalty = self.rho/2 * (violation_ineq + violation_eq)
 
-        loss = (obj + (lagrange_ineq + lagrange_eq + penalty))
+        # ! Primal loss needs to be scaled to work.
+        loss = (obj*1e3 + (lagrange_ineq + lagrange_eq + penalty))
 
         return loss
 
@@ -691,7 +692,7 @@ class DualNetEndToEnd(nn.Module):
 
         # out_mu = torch.relu(x_out[:, :self._data.nineq])
         # out_lamb = x_out[:, self._data.nineq:]
-        mu = self._data.obj_coeff + torch.bmm(eq_cm.transpose(1, 2), out_lamb.unsqueeze(-1)).squeeze(-1)
+        mu = self._data.obj_coeff - torch.bmm(eq_cm.transpose(1, 2), out_lamb.unsqueeze(-1)).squeeze(-1)
 
         mu = mu.view(mu.shape[0], self._data.sample_duration, -1)  # Shape: (batch_size, t, constraints)
 
@@ -717,10 +718,6 @@ class DualNetEndToEnd(nn.Module):
         ], dim=-1).reshape(mu.shape[0], -1)  # Flatten back to (batch_size, constraints * t)
 
         return out_mu, out_lamb
-
-class DualCompleteLayer(nn.Module):
-    def __init__():
-        super().__init__()
 
 class DualNet(nn.Module):
     def __init__(self, data, hidden_sizes, mu_size, lamb_size):

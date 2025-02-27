@@ -29,7 +29,7 @@ dir = "inputs"
 output_file = "outputs/Gurobi/output.csv"
 output_log = "outputs/Gurobi/output.txt"
 rounding = "floor"      # Type of rounding used, options are: round, ceil, floor, tno, none (when using gurobi).
-crossover = "hill_climb_first"      # Type of crossover used, options are: gurobi, hill_climb_first, hill_climb_best, none.
+crossover = "gurobi"      # Type of crossover used, options are: gurobi, hill_climb_first, hill_climb_best, none.
 relaxed = "true"        # Whether the relaxation is used or not (only set to false if using gurobi crossover)
 ramping = "false"        # Whether the ramping constraints are used or not.
 

@@ -125,11 +125,6 @@ def prep_data(args, inputs, target_path):
     pExpCap = dict(sorted(pExpCap.items()))
     pImpCap = dict(sorted(pImpCap.items()))
 
-    time_ranges = [range(i, i + args["sample_duration"], 1) for i in range(1, len(T), args["sample_duration"])]
-
-    if not os.path.exists(target_path):
-        save_opt_targets(args, experiment_instance, target_path, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, time_ranges)
-
 
     print("Creating problem instance")
     if args["operational"]:
@@ -181,7 +176,7 @@ if __name__ == "__main__":
             # Prep proble data:
             data = prep_data(args=args, inputs=experiment_instance, target_path=target_path)
 
-            # # Run PDL
+            # Run PDL
             primal_net, dual_net = run_PDL(data, args, save_dir)
 
             data.plot_balance(primal_net, dual_net)

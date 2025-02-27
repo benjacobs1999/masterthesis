@@ -61,7 +61,7 @@ class GEPProblemSet():
         self.n_md_vars = self.num_n * self.sample_duration
         self.ydim = self.n_inv_vars, self.n_prod_vars + self.n_line_vars + self.n_md_vars
 
-        self._opt_targets = self.load_targets(target_path)
+        # self._opt_targets = self.load_targets(target_path)
 
         # Masks for node balance!
         # Initialize mask

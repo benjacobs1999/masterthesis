@@ -153,6 +153,9 @@ class OptValueExtractor:
 
 def save_opt_targets(args, experiment_instance, target_path, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, time_ranges):
     extractor = OptValueExtractor()
+    print('-'*40)
+    print('Get GEP variables')
+    print('-'*40)
     for t in time_ranges:
         model, solver, time_taken = run_Gurobi_no_bounds(experiment_instance,
                     t,
@@ -172,8 +175,10 @@ def save_opt_targets(args, experiment_instance, target_path, T, N, G, L, pDemand
                     )
         extractor.extract_gep_values(model)
     
-    pGenInv = torch.stack(extractor.targets["y_investment"])
-
+    pGenInv = torch.stack(extractor.targets["y_investment"]).tolist()
+    print('-'*40)
+    print('Get operational duals')
+    print('-'*40)
     for idx, t in enumerate(time_ranges):
         model, solver, time_taken = run_operational_Gurobi_no_bounds(experiment_instance,
                     t,
