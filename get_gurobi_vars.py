@@ -176,9 +176,13 @@ def save_opt_targets(args, experiment_instance, target_path, T, N, G, L, pDemand
         extractor.extract_gep_values(model)
     
     pGenInv = torch.stack(extractor.targets["y_investment"]).tolist()
+<<<<<<< HEAD
     print('-'*40)
     print('Get operational duals')
     print('-'*40)
+=======
+
+>>>>>>> origin/main
     for idx, t in enumerate(time_ranges):
         model, solver, time_taken = run_operational_Gurobi_no_bounds(experiment_instance,
                     t,

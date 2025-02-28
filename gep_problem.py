@@ -53,13 +53,13 @@ class GEPProblemSet():
         # Time slices, each slice makes a different sample.
         self.time_ranges = [range(i, i + self.sample_duration, 1) for i in range(1, len(T), self.sample_duration)]
 
-        self.neq = self.n_eq_per_t * self.sample_duration
-        self.nineq = self.n_ineq_per_t * self.sample_duration
+        self.neq = self.n_eq_per_t * self.sample_duration 
+        self.nineq = self.n_ineq_per_t * self.sample_duration #Q Maaike: with investment var right?
         self.n_inv_vars = self.num_g
         self.n_prod_vars = self.num_g * self.sample_duration
         self.n_line_vars = self.num_l * self.sample_duration
         self.n_md_vars = self.num_n * self.sample_duration
-        self.ydim = self.n_inv_vars, self.n_prod_vars + self.n_line_vars + self.n_md_vars
+        self.ydim = self.n_inv_vars + self.n_prod_vars + self.n_line_vars + self.n_md_vars #Q Maaike: why is this  a tuple?
 
         # self._opt_targets = self.load_targets(target_path)
 
@@ -275,13 +275,12 @@ class GEPProblemSet():
     def build_ineq_cm_rhs(self,):
         ineq_cms = []
         ineq_rhss = []
-
         for time_range in self.time_ranges:
             ineq_cm, ineq_rhs = self.build_ineq_cm_rhs_sample(time_range)
             ineq_cms.append(ineq_cm)
             ineq_rhss.append(ineq_rhs)
         
-        return torch.tensor(np.array(ineq_cms)), torch.tensor(np.array(ineq_rhss))
+        return torch.stack(ineq_cms), torch.stack(ineq_rhss)
 
     def build_eq_cm_rhs(self,):
         eq_cms = []
@@ -292,7 +291,7 @@ class GEPProblemSet():
             eq_cms.append(eq_cm)
             eq_rhss.append(eq_rhs)
         
-        return torch.tensor(np.array(eq_cms)), torch.tensor(np.array(eq_rhss))
+        return torch.stack(eq_cms), torch.stack(eq_rhss)
     
     # Bounds are always identity, -1 for lower bounds, +1 for upper bounds.
     def assign_identity_or_scalar(self, matrix, row_start, col_start, size, value=1):
@@ -362,7 +361,7 @@ class GEPProblemSet():
             # 3.1j: Missed demand upper bound
             ineq_rhs += [self.pDemand[(n, t)] for n in self.N]
             
-        return ineq_cm, ineq_rhs
+        return ineq_cm, torch.tensor(ineq_rhs)
 
     def build_eq_cm_rhs_sample(self, time_range):
         """Build the constraint matrix for the equality constraints
@@ -386,7 +385,7 @@ class GEPProblemSet():
         for t in time_range:
             eq_rhs += [self.pDemand[(n, t)] for n in self.N]
 
-        return eq_cm, eq_rhs
+        return eq_cm, torch.tensor(eq_rhs)
 
     def _split_X_in_sets(self, train=0.8, valid=0.1, test=0.1):
         # Ensure the split ratios sum to 1
