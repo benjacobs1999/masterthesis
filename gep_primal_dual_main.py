@@ -191,10 +191,11 @@ if __name__ == "__main__":
             # data.plot_decision_variable_diffs(primal_net, dual_net)
 
             # Solve single sample with matrix formulation
-            # sample = 0 # only solve first sample for now 
+            sample = 1 # only solve first sample for now 
             # solution = solve_matrix_problem(data, sample) # solution = Obj: 2374.99
+            # solution sample 1 = 2790.09
 
             # Solve single sample with Benders decomposition
-            sample = 0 # solution = Obj: 2374.99
+            # sample = 0 # solution = Obj: 2374.99
             solve_with_benders(data, sample)
 

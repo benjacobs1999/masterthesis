@@ -81,7 +81,7 @@ def solve_matrix_problem_simple(obj, A_ineq, b_ineq, A_eq, b_eq, master):
     m.optimize()
 
     # print(x.X)
-    print(f"Obj: {m.ObjVal:g}")
+    # print(f"Obj: {m.ObjVal:g}")
     if master:
         dual_val = []
     else:
@@ -132,7 +132,7 @@ def find_master_problem_cm_rhs_obj(data,sample,investments,obj_val,dual_val):
     lb_constraint = torch.zeros((1,data.num_g+1))
     lb_constraint[0,-1] = -1 # coeff for alpha: -1
     A_ineq = torch.cat((A_ineq,lb_constraint),0)
-    rhs = 1e-06
+    rhs = 1e06
     b_ineq = torch.cat((b_ineq, torch.tensor([rhs])),0)
 
     # Add Benders cuts for alpha
@@ -145,15 +145,15 @@ def find_master_problem_cm_rhs_obj(data,sample,investments,obj_val,dual_val):
         b_ineq = torch.cat((b_ineq, torch.tensor([rhs])),0)
 
     # Add upper bounds on the investments (this is not necessary)
-    rhs = 20000. #TODO change this value for different instances
+    rhs = 100000. #TODO change this value for different instances
     for g in range(data.num_g):
         ub_constraint = torch.zeros((1,data.num_g+1))
         ub_constraint[0,g] = 1 # coeff for ui_g: 1
         A_ineq = torch.cat((A_ineq,ub_constraint),0)
         b_ineq = torch.cat((b_ineq, torch.tensor([rhs])),0)
 
-    print('A_ineq',A_ineq)
-    print('b_ineq',b_ineq)
+    # print('A_ineq',A_ineq)
+    # print('b_ineq',b_ineq)
 
     return obj, A_ineq, b_ineq, A_eq, b_eq
 
@@ -171,7 +171,7 @@ def solve_subproblems(data,sample,investments):
 
     for time_step in range(num_timesteps):
 
-        print("Solving subproblem", time_step)
+        # print("Solving subproblem", time_step)
 
         # Find constraint matrices, right hand side vectors and objective vector of subproblem
         obj, A_ineq, b_ineq, A_eq, b_eq = find_subproblem_cm_rhs_obj(data,sample,investments,time_step)
@@ -252,6 +252,8 @@ def solve_with_benders(data, sample):
     iter = 0
     while not optimal:
 
+        print("Iteration", iter)
+
         # Find the investment decisions
         if iter == 0:
             # Generate initial investment solution
@@ -280,11 +282,13 @@ def solve_with_benders(data, sample):
         # Add dual variable values of current iteration to list
         dual_val_subproblems_all.append(torch.tensor(dual_val_all))
 
-        print('dual_val_all',dual_val_all)
+        # print('dual_val_all',dual_val_all)
 
         # Check for optimality
         lower_bound = obj_val_master[0] + obj_val_master[1]
         upper_bound = obj_val_master[0] + obj_val_total
+        print("Upper bound:",upper_bound)
+        print("Lower bound",lower_bound)
         if upper_bound - lower_bound < epsilon:
             optimal = True
             print('Done! Optimal solution found')
