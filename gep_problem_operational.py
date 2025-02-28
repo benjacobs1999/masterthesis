@@ -270,8 +270,7 @@ class GEPOperationalProblemSet():
                 coeff_idx = t * self.n_var_per_t + self.num_g + self.num_l + idx_n
                 c[coeff_idx] = self.pVOLL
 
-        # ! Times pWeight to follow objective function.
-        return self.pWeight * c
+        return c
 
     def build_X(self,):
         X = []
