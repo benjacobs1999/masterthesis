@@ -4,7 +4,7 @@ import time
 from gep_config_parser import *
 from data_wrangling import dataframe_to_dict
 
-from primal_dual import PrimalDualTrainer
+from primal_dual import PrimalDualTrainer, load
 from gep_problem import GEPProblemSet
 from gep_problem_operational import GEPOperationalProblemSet
 from get_gurobi_vars import save_opt_targets
@@ -125,6 +125,10 @@ def prep_data(args, inputs, target_path):
     pExpCap = dict(sorted(pExpCap.items()))
     pImpCap = dict(sorted(pImpCap.items()))
 
+    if not os.path.exists(target_path):
+        time_ranges = [range(i, i + args["sample_duration"], 1) for i in range(1, len(T), args["sample_duration"])]
+        save_opt_targets(args, inputs, target_path, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, time_ranges)
+
 
     print("Creating problem instance")
     if args["operational"]:
@@ -133,13 +137,6 @@ def prep_data(args, inputs, target_path):
         data = GEPProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, target_path=target_path)
 
     return data
-
-def run_PDL(data, args, save_dir):
-    # Run PDL
-    print("Training the PDL")
-    trainer = PrimalDualTrainer(data, args, save_dir)
-    primal_net, dual_net, stats = trainer.train_PDL()
-    return primal_net, dual_net
 
 if __name__ == "__main__":
     import json
@@ -177,7 +174,10 @@ if __name__ == "__main__":
             data = prep_data(args=args, inputs=experiment_instance, target_path=target_path)
 
             # Run PDL
-            primal_net, dual_net = run_PDL(data, args, save_dir)
+            trainer = PrimalDualTrainer(data, args, save_dir)
+            primal_net, dual_net, stats = trainer.train_PDL()
+
+            primal_net, dual_net = load(data, save_dir)
 
             data.plot_balance(primal_net, dual_net)
             data.plot_decision_variable_diffs(primal_net, dual_net)

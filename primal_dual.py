@@ -292,6 +292,7 @@ class PrimalDualTrainer():
                         num_batches += 1
                     
                     # Compute average loss for the epoch
+                    #! Scheduler on training set (should be validation set)
                     avg_train_loss = total_train_loss / num_batches
                     self.primal_scheduler.step(avg_train_loss)
 
@@ -347,6 +348,7 @@ class PrimalDualTrainer():
                         total_train_loss += batch_loss.item()
                         num_batches += 1
                     
+                    #! Scheduler on training set (should be validation set)
                     avg_train_loss = total_train_loss / num_batches
                     self.dual_scheduler.step(avg_train_loss)
                     
@@ -392,10 +394,8 @@ class PrimalDualTrainer():
 
         with open(os.path.join(self.save_dir, 'stats.dict'), 'wb') as f:
             pickle.dump(stats, f)
-        with open(os.path.join(self.save_dir, 'primal_net.dict'), 'wb') as f:
-            torch.save(self.primal_net.state_dict(), f)
-        with open(os.path.join(self.save_dir, 'dual_net.dict'), 'wb') as f:
-            torch.save(self.dual_net.state_dict(), f)
+        
+        self.save(self.save_dir)
 
         return self.primal_net, self.dual_net, stats
 
@@ -494,78 +494,10 @@ class PrimalDualTrainer():
         
         return v_k.max().item()
 
-    # Modifies stats in place
-    def dict_agg(self, stats, key, value, op='concat'):
-        if key in stats.keys():
-            if op == 'sum':
-                stats[key] += value
-            elif op == 'concat':
-                stats[key] = np.concatenate((stats[key], value), axis=0)
-            else:
-                raise NotImplementedError
-        else:
-            stats[key] = value
+    def save(self, save_dir):
+        torch.save(self.primal_net.state_dict(), save_dir + 'primal_weights.pth')
+        torch.save(self.dual_net.state_dict(), save_dir + 'dual_weights.pth')
 
-    # Modifies stats in place
-    def eval_pdl(self, X, eq_cm, ineq_cm, eq_rhs, ineq_rhs, primal_net, dual_net, prefix, stats, targets=None):
-
-        eps_converge = self.args['corrEps']
-        make_prefix = lambda x: "{}_{}".format(prefix, x)
-        start_time = time.time()
-        # Y = primal_net(X_scaled)
-        # mu, lamb = dual_net(X_scaled)
-        Y = primal_net(X)
-        mu, lamb = dual_net(X)
-        raw_end_time = time.time()
-        Ycorr = Y
-
-        # Ycorr, steps = grad_steps_all(data, X, Y, args)
-
-        self.dict_agg(stats, make_prefix('time'), time.time() - start_time, op='sum')
-        # self.dict_agg(stats, make_prefix('steps'), np.array([steps]))
-        self.dict_agg(stats, make_prefix('primal_loss'), self.primal_loss(Y, eq_cm, ineq_cm, eq_rhs, ineq_rhs, mu, lamb).detach().cpu().numpy())
-        # self.dict_agg(stats, make_prefix('dual_loss'), self.dual_loss(X, Y, mu, lamb, mu_k, lamb_k, log_type=None).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('eval'), self.data.obj_fn(Ycorr).detach().cpu().numpy())
-
-        self.dict_agg(stats, make_prefix('ineq_max'), torch.max(self.data.ineq_dist(Y, ineq_cm, ineq_rhs), dim=1)[0].detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('ineq_mean'), torch.mean(self.data.ineq_dist(Y, ineq_cm, ineq_rhs,), dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('ineq_num_viol_0'),
-                torch.sum(self.data.ineq_dist(Y, ineq_cm, ineq_rhs) > eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('ineq_num_viol_1'),
-                torch.sum(self.data.ineq_dist(Y, ineq_cm, ineq_rhs) > 10 * eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('ineq_num_viol_2'),
-                torch.sum(self.data.ineq_dist(Y, ineq_cm, ineq_rhs) > 100 * eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('eq_max'),
-                torch.max(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)), dim=1)[0].detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('eq_mean'), torch.mean(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)), dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('eq_num_viol_0'),
-                torch.sum(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)) > eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('eq_num_viol_1'),
-                torch.sum(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)) > 10 * eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('eq_num_viol_2'),
-                torch.sum(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)) > 100 * eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_time'), raw_end_time - start_time, op='sum')
-        self.dict_agg(stats, make_prefix('raw_eval'), self.data.obj_fn(Y).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_ineq_max'), torch.max(self.data.ineq_dist(Y, ineq_cm, ineq_rhs), dim=1)[0].detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_ineq_mean'), torch.mean(self.data.ineq_dist(Y, ineq_cm, ineq_rhs), dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_ineq_num_viol_0'),
-                torch.sum(self.data.ineq_dist(Y, ineq_cm, ineq_rhs) > eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_ineq_num_viol_1'),
-                torch.sum(self.data.ineq_dist(Y, ineq_cm, ineq_rhs) > 10 * eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_ineq_num_viol_2'),
-                torch.sum(self.data.ineq_dist(Y, ineq_cm, ineq_rhs) > 100 * eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_eq_max'),
-                torch.max(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)), dim=1)[0].detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_eq_mean'),
-                torch.mean(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)), dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_eq_num_viol_0'),
-                torch.sum(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)) > eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_eq_num_viol_1'),
-                torch.sum(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)) > 10 * eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_eq_num_viol_2'),
-                torch.sum(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)) > 100 * eps_converge, dim=1).detach().cpu().numpy())
-
-        return stats
 
 class PrimalNet(nn.Module):
     def __init__(self, data, hidden_sizes):
@@ -968,3 +900,10 @@ class PrimalNetEndToEnd(nn.Module):
             return y
          
          
+def load(data, save_dir):
+    primal_net = PrimalNetEndToEnd(data=data)
+    primal_net.load_state_dict(torch.load(save_dir + 'primal_weights.pth'))
+    dual_net = DualNetEndToEnd(data=data)
+    dual_net.load_state_dict(torch.load(save_dir + 'dual_weights.pth'))
+
+    return primal_net, dual_net
