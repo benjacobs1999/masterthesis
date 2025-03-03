@@ -74,8 +74,9 @@ class TensorBoardLogger():
 
             eq_resid = data.eq_resid(Y, data.eq_cm[data.train_indices], data.eq_rhs[data.train_indices])
 
-            obj_target = data.obj_fn(Y_target)
-            dual_obj_target = data.dual_obj_fn(data.eq_rhs[data.train_indices], data.ineq_rhs[data.train_indices], mu_target, lamb_target)
+            obj_target = data.obj_fn_log(Y_target)
+            # dual_obj_target = data.dual_obj_fn(data.eq_rhs[data.train_indices], data.ineq_rhs[data.train_indices], mu_target, lamb_target)
+            dual_obj_target = obj_target # With LP, there is strong duality, so dual obj = primal obj.
 
             # Obj funcs
             self.writer.add_scalar(f"Train_obj/obj", obj.mean(), step)
@@ -84,9 +85,13 @@ class TensorBoardLogger():
             self.writer.add_scalar(f"Train_obj/dual_obj_optimality_gap", ((dual_obj - dual_obj_target)/dual_obj_target).mean(), step)
 
             # Neural network outputs and targets
-            Y_diff = (Y - Y_target).abs()
+            if data.args["benders_compact"]:
+                Y_diff = (Y[:, data.num_g:] - Y_target).abs()
+                lamb_diff = (lamb[:, data.num_g:] - lamb_target).abs()
+            else:
+                Y_diff = (Y - Y_target).abs()
+                lamb_diff = (lamb - lamb_target).abs()
             mu_diff = (mu - mu_target).abs()
-            lamb_diff = (lamb - lamb_target).abs()
             self.writer.add_scalar(f"Train_outputs/Y", Y.mean(), step)
             self.writer.add_scalar(f"Train_outputs/mu", mu.mean(), step)
             self.writer.add_scalar(f"Train_outputs/lamb", lamb.mean(), step)
@@ -104,7 +109,7 @@ class TensorBoardLogger():
 
             # Primal variable specific differences
             p_gt, f_lt, md_nt = data.split_dec_vars_from_Y(Y)
-            p_gt_target, f_lt_target, md_nt_target = data.split_dec_vars_from_Y(Y_target)
+            p_gt_target, f_lt_target, md_nt_target = data.split_dec_vars_from_Y(Y_target, log=True)
             diff_p_gt = p_gt - p_gt_target
             diff_f_lt = f_lt - f_lt_target
             diff_md_nt = md_nt - md_nt_target
@@ -116,7 +121,7 @@ class TensorBoardLogger():
             # self.writer.add_scalar(f"Train_var_diffs/diff_ui_g", diff_ui_g.mean(), step)
 
             h, b, d, e, i, j = data.split_ineq_constraints(ineq_dist)
-            c = data.split_eq_constraints(eq_resid)
+            ui_g, c = data.split_eq_constraints(eq_resid)
 
             self.writer.add_scalar(f"Train_constraint_specific/p_gt_ub", b.mean(), step)
             self.writer.add_scalar(f"Train_constraint_specific/node_balance", c.mean(), step)
@@ -141,8 +146,8 @@ class TensorBoardLogger():
             mu_j_diff = mu_target_j - mu_j
 
             # # equality
-            lamb_c = data.split_eq_constraints(lamb)
-            lamb_target_c = data.split_eq_constraints(lamb_target)
+            ui_g, lamb_c = data.split_eq_constraints(lamb)
+            ui_g, lamb_target_c = data.split_eq_constraints(lamb_target, log=True)
             lamb_c_diff = lamb_target_c - lamb_c
 
             self.writer.add_scalar(f"Train_dual_var_diffs/gen_ub", mu_b_diff.mean(), step)
@@ -495,8 +500,9 @@ class PrimalDualTrainer():
         return v_k.max().item()
 
     def save(self, save_dir):
-        torch.save(self.primal_net.state_dict(), save_dir + 'primal_weights.pth')
-        torch.save(self.dual_net.state_dict(), save_dir + 'dual_weights.pth')
+        print("saving")
+        torch.save(self.primal_net.state_dict(), save_dir + '/primal_weights.pth')
+        torch.save(self.dual_net.state_dict(), save_dir + '/dual_weights.pth')
 
 
 class PrimalNet(nn.Module):
@@ -525,87 +531,6 @@ class PrimalNet(nn.Module):
     def forward(self, x, eq_rhs, ineq_rhs):
         return self.net(x)
 
-class PrimalGCNNet(nn.Module):
-    def __init__(self, data, hidden_sizes):
-        super().__init__()
-        self._data = data
-        self._hidden_sizes = hidden_sizes
-        
-        self.gcn = torch_geometric.nn.conv.GCNConv(1, 1)
-        self.gcn.reset_parameters()
-        # Create the list of layer sizes
-        layer_sizes = [data.xdim] + self._hidden_sizes + [data.ydim]
-        layers = []
-
-        # Create layers dynamically based on the provided hidden_sizes
-        for in_size, out_size in zip(layer_sizes[:-1], layer_sizes[1:]):
-            layers.append(nn.Linear(in_size, out_size))
-            if out_size != data.ydim:  # Add ReLU activation for hidden layers only
-                layers.append(nn.ReLU())
-
-        # Initialize all layers
-        for layer in layers:
-            if isinstance(layer, nn.Linear):
-                nn.init.kaiming_normal_(layer.weight)
-
-        self.net = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        # ! Only works for batches of 1!
-        edge_index = self._data.edge_index_demand
-        x_pDemand = x[:, :self._data.neq]
-        x_pGenAva = x[:, self._data.neq:]
-        # Reshape x_pDemand for GCN: [batch_size * num_nodes, 1]
-        batch_size, num_nodes = x_pDemand.shape
-        x_pDemand = x_pDemand.T.reshape(-1, 1)  # Shape: [batch_size * num_nodes, 1]
-
-         # Apply GCN layer
-        x_pDemand = self.gcn(x_pDemand, edge_index.repeat(1, batch_size))  # Use repeated edge_index
-        x_pDemand = torch.relu(x_pDemand)
-
-        # Reshape back to batch dimension: [batch_size, num_nodes]
-        x_pDemand = x_pDemand.view(num_nodes, batch_size).T
-
-        x = torch.concat([x_pDemand, x_pGenAva], dim=1)
-
-        return self.net(x)
-    
-class PrimalCNNNet(nn.Module):
-    def __init__(self, data, hidden_channels, kernel_size=3):
-        super().__init__()
-        self._data = data
-        self._hidden_channels = hidden_channels
-        
-        # Define input and output sizes
-        input_features = data.xdim
-        output_features = data.ydim
-
-        # Create convolutional layers
-        layers = []
-        channels = [1] + hidden_channels  # Start with single input channel
-
-        for in_channels, out_channels in zip(channels[:-1], channels[1:]):
-            layers.append(nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=kernel_size // 2))
-            layers.append(nn.ReLU())
-
-        # Final layer to map to output dimensions
-        layers.append(nn.Conv1d(hidden_channels[-1], 1, kernel_size=kernel_size, padding=kernel_size // 2))
-
-        self.conv_net = nn.Sequential(*layers)
-        self.fc = nn.Linear(input_features, output_features)
-
-    def forward(self, x):
-        # Reshape input to [batch_size, 1, num_features] for Conv1d
-        x = x.unsqueeze(1)
-
-        # Pass through convolutional layers
-        x = self.conv_net(x)
-
-        # Flatten back to [batch_size, num_features]
-        x = x.squeeze(1)
-
-        # Map to final output using a fully connected layer
-        return self.fc(x)
 
 class DualNetEndToEnd(nn.Module):
     def __init__(self, data, n_size_factor=1.5, n_layers=4):
@@ -613,18 +538,30 @@ class DualNetEndToEnd(nn.Module):
         self._data = data
         self._hidden_sizes = [int(n_size_factor*data.xdim)] * n_layers
 
-        self._out_dim = data.n_prod_vars + data.n_line_vars
+        if data.args["benders_compact"]:
+            self._out_dim = data.num_g + data.neq
+        else:
+            self._out_dim = data.neq
 
         #! Only predict lambda, we infer mu from it.
-        self.feed_forward = FeedForwardNet(data.xdim, self._hidden_sizes, output_dim=data.neq)
+        self.feed_forward = FeedForwardNet(data.xdim, self._hidden_sizes, output_dim=self._out_dim)
         
         
     def forward(self, x, eq_cm):
         out_lamb = self.feed_forward(x)
 
-        # out_mu = torch.relu(x_out[:, :self._data.nineq])
-        # out_lamb = x_out[:, self._data.nineq:]
-        mu = self._data.obj_coeff - torch.bmm(eq_cm.transpose(1, 2), out_lamb.unsqueeze(-1)).squeeze(-1)
+        # first num_g outputs are the equality constraints added in benders compact form
+        if self._data.args["benders_compact"]:
+            # lamb_ui_g = out_lamb[:, :self._data.num_g]
+            lamb_D_nt = out_lamb[:, self._data.num_g:]
+            eq_cm_D_nt = eq_cm[:, self._data.num_g:, self._data.num_g:]
+            obj_coeff = self._data.obj_coeff[self._data.num_g:]
+        else:
+            eq_cm_D_nt = eq_cm
+            lamb_D_nt = out_lamb
+            obj_coeff = self._data.obj_coeff
+
+        mu = obj_coeff - torch.bmm(eq_cm_D_nt.transpose(1, 2), lamb_D_nt.unsqueeze(-1)).squeeze(-1)
 
         mu = mu.view(mu.shape[0], self._data.sample_duration, -1)  # Shape: (batch_size, t, constraints)
 
@@ -721,64 +658,6 @@ class DualNetTwoOutputLayers(nn.Module):
         return out_mu, out_lamb
 
 
-class DualGCNNet(nn.Module):
-    def __init__(self, data, hidden_sizes, mu_size, lamb_size):
-        super().__init__()
-        self._data = data
-        self._hidden_sizes = hidden_sizes
-        self._mu_size = mu_size
-        self._lamb_size = lamb_size
-
-        self.gcn = torch_geometric.nn.conv.GCNConv(1, 1)
-        self.gcn.reset_parameters()
-        # Create the list of layer sizes
-        layer_sizes = [data.xdim] + self._hidden_sizes
-        layers = []
-
-        # Create layers dynamically based on the provided hidden_sizes
-        for in_size, out_size in zip(layer_sizes[:-1], layer_sizes[1:]):
-            layers.append(nn.Linear(in_size, out_size))
-            if out_size != data.ydim:  # Add ReLU activation for hidden layers only
-                layers.append(nn.ReLU())
-
-        # Initialize all layers
-        for layer in layers:
-            if isinstance(layer, nn.Linear):
-                nn.init.kaiming_normal_(layer.weight)
-        
-         # Add the output layer
-        self.out_layer = nn.Linear(self._hidden_sizes[-1], self._mu_size + self._lamb_size)
-        nn.init.zeros_(self.out_layer.weight)  # Initialize output layer weights to 0
-        nn.init.zeros_(self.out_layer.bias)    # Initialize output layer biases to 0
-        layers.append(self.out_layer)
-
-        self.net = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        # ! Only works for batches of 1!
-        edge_index = self._data.edge_index_demand
-        x_pDemand = x[:, :self._data.neq]
-        x_pGenAva = x[:, self._data.neq:]
-        # Reshape x_pDemand for GCN: [batch_size * num_nodes, 1]
-        batch_size, num_nodes = x_pDemand.shape
-        x_pDemand = x_pDemand.T.reshape(-1, 1)  # Shape: [batch_size * num_nodes, 1]
-
-         # Apply GCN layer
-        x_pDemand = self.gcn(x_pDemand, edge_index.repeat(1, batch_size))  # Use repeated edge_index
-        x_pDemand = torch.relu(x_pDemand)
-
-        # Reshape back to batch dimension: [batch_size, num_nodes]
-        x_pDemand = x_pDemand.view(num_nodes, batch_size).T
-
-        x = torch.concat([x_pDemand, x_pGenAva], dim=1)
-        x = torch.concat([x_pDemand, x_pGenAva], dim=1)
-
-        out = self.net(x)
-        out_mu = out[:, :self._mu_size]
-        out_lamb = out[:, self._mu_size:]
-
-        return out_mu, out_lamb
-
 class FeedForwardNet(nn.Module):
     def __init__(self, input_dim, hidden_sizes, output_dim):
         """_summary_
@@ -870,9 +749,12 @@ class PrimalNetEndToEnd(nn.Module):
             self._data = data
             self._hidden_sizes = [int(n_size_factor*data.xdim)] * n_layers
 
-            self._out_dim = data.n_prod_vars + data.n_line_vars
+            if self._data.args["benders_compact"]:
+                self._out_dim = data.num_g + data.n_prod_vars + data.n_line_vars
+            else:
+                self._out_dim = data.n_prod_vars + data.n_line_vars
 
-            self.feed_forward = FeedForwardNet(data.xdim, self._hidden_sizes, output_dim=data.n_prod_vars+data.n_line_vars)
+            self.feed_forward = FeedForwardNet(data.xdim, self._hidden_sizes, output_dim=self._out_dim)
             self.bound_repair_layer = BoundRepairLayer()
             # self.ramping_repair_layer = RampingRepairLayer()
 
@@ -882,7 +764,7 @@ class PrimalNetEndToEnd(nn.Module):
             x_out = self.feed_forward(x)
 
             # [B, G, T], [B, L, T]
-            p_gt, f_lt = self._data.split_dec_vars_from_Y_raw(x_out)
+            ui_g, p_gt, f_lt = self._data.split_dec_vars_from_Y_raw(x_out)
             
             # [B, bounds, T]
             p_gt_lb, p_gt_ub, f_lt_lb, f_lt_ub, md_nt_lb, md_nt_ub = self._data.split_ineq_constraints(ineq_rhs)
@@ -892,18 +774,21 @@ class PrimalNetEndToEnd(nn.Module):
             # Lineflow lower bound is negative.
             f_lt_bound_repaired = self.bound_repair_layer(f_lt, -f_lt_lb, f_lt_ub)
 
-            D_nt = self._data.split_eq_constraints(eq_rhs)
+            UI_g, D_nt = self._data.split_eq_constraints(eq_rhs)
             md_nt = self.estimate_slack_layer(p_gt_bound_repaired, f_lt_bound_repaired, D_nt)
 
             y = torch.cat([p_gt_bound_repaired, f_lt_bound_repaired, md_nt], dim=1).permute(0, 2, 1).reshape(x_out.shape[0], -1)
+
+            if self._data.args["benders_compact"]:
+                y = torch.cat([ui_g, y], dim=1)
 
             return y
          
          
 def load(data, save_dir):
     primal_net = PrimalNetEndToEnd(data=data)
-    primal_net.load_state_dict(torch.load(save_dir + 'primal_weights.pth'))
+    primal_net.load_state_dict(torch.load(save_dir + '/primal_weights.pth', weights_only=True))
     dual_net = DualNetEndToEnd(data=data)
-    dual_net.load_state_dict(torch.load(save_dir + 'dual_weights.pth'))
+    dual_net.load_state_dict(torch.load(save_dir + '/dual_weights.pth', weights_only=True))
 
     return primal_net, dual_net

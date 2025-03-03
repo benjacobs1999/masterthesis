@@ -16,13 +16,17 @@ class GEPOperationalProblemSet():
         self.DEVICE = torch.device="cpu"
         torch.set_default_dtype(self.DTYPE)
 
+        # Whether we will use Benders in compact form or not.
+        self.benders_compact_form = args["benders_compact"]
+
         # Args:
         self.args = args
-        self.sample_duration = args["sample_duration"]
+        # Operation sample is always of length 1 for benders!
+        self.sample_duration = 1
+        # self.sample_duration = args["sample_duration"]
         self.train = args["train"]
         self.valid = args["valid"]
         self.test = args["test"]
-
 
         # Input Sets
         self.T = T
@@ -94,8 +98,7 @@ class GEPOperationalProblemSet():
         print("Populating eq constraints")
         self.eq_cm, self.eq_rhs = self.build_eq_cm_rhs()
         print("Creating objective coefficients")
-        self.obj_coeff = self.build_obj_coeff()
-        print("Creating input for NN: X")
+        self.obj_coeff, self.obj_coeff_log = self.build_obj_coeff()
         # self.X = self.build_X()
         self.X = torch.concat([self.eq_rhs, self.ineq_rhs], dim=1)
         self.xdim = self.X.shape[1]
@@ -131,6 +134,7 @@ class GEPOperationalProblemSet():
         
         return indices
     
+    # TODO: Change for compact form!
     def split_ineq_constraints(self, ineq):
         """Groups the inequality [residuals or RHS] into constraints by constraint type.
             Assume ineq = [3.1h, 3.1b, 3.1d, 3.1e, 3.1i, 3,1j] * T (per sample in batch)
@@ -153,7 +157,8 @@ class GEPOperationalProblemSet():
 
         return h, b, d, e, i, j
     
-    def split_eq_constraints(self, eq):
+    # TODO: Change for compact form!
+    def split_eq_constraints(self, eq, log=False):
         """Groups the inequality [residuals or RHS] into constraints by constraint type.
             Assume ineq = [3.1c] * T (per sample in batch)
 
@@ -162,9 +167,18 @@ class GEPOperationalProblemSet():
             Returns c
         """
         batch_size = eq.shape[0]
-        c = eq.view(batch_size, self.sample_duration, self.n_eq_per_t).permute(0, 2, 1)
-        return c
+        # If we are using compact form, we have ui_g = UI_G constraints prepended.
+        if self.benders_compact_form and not log:
+            ui_g = eq[:, :self.num_g]
+            ui_g = ui_g.view(batch_size, self.sample_duration, self.num_g).permute(0, 2, 1)
+            c = eq[:, self.num_g:]
+            c = c.view(batch_size, self.sample_duration, self.n_eq_per_t).permute(0, 2, 1)
+        else:
+            ui_g = None
+            c = eq.view(batch_size, self.sample_duration, self.n_eq_per_t).permute(0, 2, 1)
+        return ui_g, c
 
+    # TODO: Change for compact form
     def split_dec_vars_from_Y_raw(self, Y):
         """Groups the decision variables from the NN output BEFORE REPAIRS by type.
             Assume y =  [p_{g,t0}, f_{l,t0}, 
@@ -175,6 +189,12 @@ class GEPOperationalProblemSet():
         """
         batch_size = Y.shape[0]  # Get batch size
 
+        if self.benders_compact_form:
+            ui_g = Y[:, :self.num_g]
+            Y = Y[:, self.num_g:]
+        else:
+            ui_g = None
+
         # Reshape Y for efficient slicing
         Y = Y.view(batch_size, self.sample_duration, self.n_var_per_t - self.num_n).permute(0, 2, 1)
 
@@ -184,9 +204,10 @@ class GEPOperationalProblemSet():
         # Extract constraint tensors
         p_gt, f_lt = torch.split(Y, sizes, dim=1)
 
-        return p_gt, f_lt
+        return ui_g, p_gt, f_lt
 
-    def split_dec_vars_from_Y(self, Y):
+    # TODO: Change for compact form
+    def split_dec_vars_from_Y(self, Y, log=False):
         """Groups the decision variables from the NN output AFTER REPAIRS by type.
             Assume y =  [p_{g,t0}, f_{l,t0}, md_{n,t0}, 
                          p_{g,t1}, f_{l,t1}, md_{n,t1}, ..., 
@@ -197,6 +218,9 @@ class GEPOperationalProblemSet():
         batch_size = Y.shape[0]  # Get batch size
 
         # Reshape Y to [batch_size, sample_duration, -1] for efficient slicing
+        if self.benders_compact_form and not log:
+            Y = Y[:, self.num_g:]
+
         Y = Y.view(batch_size, self.sample_duration, self.n_var_per_t).permute(0, 2, 1)
 
         # Define segment sizes
@@ -218,7 +242,6 @@ class GEPOperationalProblemSet():
         torch.bmm(eq_cm, Y.unsqueeze(-1)).squeeze(-1)
         return eq_rhs - torch.bmm(eq_cm, Y.unsqueeze(-1)).squeeze(-1)
     
-        #! Enforce this with a ReLU.
     def dual_ineq_resid(self, mu, lamb):
         """Dual inequality Residual, takes on the form:
             -mu <= 0
@@ -237,6 +260,10 @@ class GEPOperationalProblemSet():
         Y = Y.clone()
         Y[:, self.md_indices] = Y[:, self.md_indices].abs()
         return self.obj_coeff @ Y.T
+    
+    def obj_fn_log(self, Y):
+        # obj_coeff does not need batching, objective is the same over different samples.
+        return self.obj_coeff_log @ Y.T
     
     def dual_obj_fn(self, eq_rhs, ineq_rhs, mu, lamb):
         # Batched dot product
@@ -269,10 +296,14 @@ class GEPOperationalProblemSet():
                 # Missed demand variables come after generator and lineflow variables
                 coeff_idx = t * self.n_var_per_t + self.num_g + self.num_l + idx_n
                 c[coeff_idx] = self.pVOLL
+        
+        if self.benders_compact_form:
+            c_compact = torch.cat((torch.zeros(self.num_g), c), 0)
 
-        return c
+        return c_compact, c
 
     def build_X(self,):
+        # TODO: Change this when experimenting with different input features.
         X = []
         for time_range in self.time_ranges:
             x = []
@@ -294,18 +325,18 @@ class GEPOperationalProblemSet():
             ineq_cms.append(ineq_cm)
             ineq_rhss.append(ineq_rhs)
         
-        return torch.tensor(np.array(ineq_cms)), torch.tensor(np.array(ineq_rhss))
+        return torch.stack(ineq_cms), torch.stack(ineq_rhss)
 
     def build_eq_cm_rhs(self,):
         eq_cms = []
         eq_rhss = []
 
-        for time_range in self.time_ranges:
-            eq_cm, eq_rhs = self.build_eq_cm_rhs_sample(time_range)
+        for idx, time_range in enumerate(self.time_ranges):
+            eq_cm, eq_rhs = self.build_eq_cm_rhs_sample(time_range, idx)
             eq_cms.append(eq_cm)
             eq_rhss.append(eq_rhs)
         
-        return torch.tensor(np.array(eq_cms)), torch.tensor(np.array(eq_rhss))
+        return torch.stack(eq_cms), torch.stack(eq_rhss)
     
     # Bounds are always identity, -1 for lower bounds, +1 for upper bounds.
     def assign_identity_or_scalar(self, matrix, row_start, col_start, size, value=1):
@@ -315,6 +346,7 @@ class GEPOperationalProblemSet():
         else:
             matrix[row_start, col_start] = value
 
+    # TODO: Change for compact form
     def build_ineq_cm_rhs_sample(self, time_range, sample_idx):
         """For a single data sample characterised by the time_range, 
         build the full inequality constraint matrix for all timesteps using Kronecker product.
@@ -343,7 +375,13 @@ class GEPOperationalProblemSet():
         # Use Kronecker product to copy the block matrix diagonally for all timesteps
         ineq_cm = torch.kron(torch.eye(num_timesteps), block_matrix)
 
+        if self.benders_compact_form:
+            # Append columns of zeroes (one for each generator), there are no inequality constraints on the investment variables
+            zeros = torch.zeros((ineq_cm.shape[0], self.num_g))
+            ineq_cm = torch.cat([zeros, ineq_cm], dim=1)
+
         ineq_rhs = []
+
         # Create right hand side:
         for t in time_range:
             # 3.1h: Production lower bound
@@ -359,9 +397,9 @@ class GEPOperationalProblemSet():
             # 3.1j: Missed demand upper bound
             ineq_rhs += [self.pDemand[(n, t)] for n in self.N]
             
-        return ineq_cm, ineq_rhs
+        return ineq_cm, torch.tensor(ineq_rhs)
 
-    def build_eq_cm_rhs_sample(self, time_range):
+    def build_eq_cm_rhs_sample(self, time_range, sample_idx):
         """Build the constraint matrix for the equality constraints
         """
         # TODO: Convert to sparse matrix for efficiency??
@@ -373,12 +411,23 @@ class GEPOperationalProblemSet():
         # Use Kronecker product to copy the block matrix diagonally for all timesteps
         eq_cm = torch.kron(torch.eye(num_timesteps), block_matrix)
 
+        # If we are using the compact form, add ui_g to the constraint matrix. (for ui_g == UI_g constraints)
+        if self.benders_compact_form:
+            # Prepend ui_g constraints (top left corner of cm)
+            ui_g = torch.eye(self.num_g)
+            eq_cm = torch.block_diag(ui_g, eq_cm)
+
         eq_rhs = []
+        # If we are using the compact form, add investment 'parameter' to the RHS.
+        # TODO: Is it correct to take RHS (UI_g) from Gurobi optimal solution for ui_g? Or should training data be generated to include various UI_G's (like it will encounter in Benders)
+        if self.benders_compact_form:
+            eq_rhs += self.opt_targets["y_investment"][sample_idx].tolist()
+
         # Build right hand side:
         for t in time_range:
             eq_rhs += [self.pDemand[(n, t)] for n in self.N]
-
-        return eq_cm, eq_rhs
+                
+        return eq_cm, torch.tensor(eq_rhs)
 
     def _split_X_in_sets(self, train=0.8, valid=0.1, test=0.1):
         # Ensure the split ratios sum to 1
@@ -437,7 +486,7 @@ class GEPOperationalProblemSet():
             
             # Extract decision variables
             p_gt, f_lt, md_nt = self.split_dec_vars_from_Y(Y)  # [B, (G|L|N), T]
-            D_nt = self.split_eq_constraints(self.eq_rhs[:1])  # [1, N, T]
+            UI_g, D_nt = self.split_eq_constraints(self.eq_rhs[:1])  # [1, N, T]
             
             # Convert to numpy and ensure correct shape
             total_prod = self.total_prod(p_gt[:1])[0].cpu().numpy()  # Shape [N, T], always positive
@@ -514,13 +563,13 @@ class GEPOperationalProblemSet():
             lamb_target = self.opt_targets["lamb_operational"][self.train_indices]
             
             p_gt, f_lt, md_nt = self.split_dec_vars_from_Y(Y)  
-            p_gt_target, f_lt_target, md_nt_target = self.split_dec_vars_from_Y(Y_target)  
+            p_gt_target, f_lt_target, md_nt_target = self.split_dec_vars_from_Y(Y_target, log=True)  
 
             dual_lb_p, dual_ub_p, dual_lb_f, dual_ub_f, dual_lb_md, dual_ub_md = self.split_ineq_constraints(mu)
             dual_target_lb_p, dual_target_ub_p, dual_target_lb_f, dual_target_ub_f, dual_target_lb_md, dual_target_ub_md = self.split_ineq_constraints(mu_target)
 
-            dual_node_balance = self.split_eq_constraints(lamb)
-            dual_node_balance_target = self.split_eq_constraints(lamb_target)
+            ui_g, dual_node_balance = self.split_eq_constraints(lamb)
+            ui_g, dual_node_balance_target = self.split_eq_constraints(lamb_target, log=True)
 
             num_gens, num_lines, num_nodes, num_timesteps = p_gt.shape[1], f_lt.shape[1], md_nt.shape[1], p_gt.shape[2]
             

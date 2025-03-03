@@ -1,46 +1,19 @@
-<<<<<<< HEAD
 {   
     "N": ["BEL", "GER"],
     "G": [["BEL", "SunPV"], ["GER", "SunPV"]],
     "L": [["BEL", "GER"]],
     "operational": true,
-=======
-{
-    "N": [
-        "BEL",
-        "GER"
-    ],
-    "G": [
-        [
-            "BEL",
-            "SunPV"
-        ],
-        [
-            "GER",
-            "SunPV"
-        ]
-    ],
-    "L": [
-        [
-            "BEL",
-            "GER"
-        ]
-    ],
-    "operational": false,
->>>>>>> origin/main
-    "sample_duration": 24,
+    "benders_compact": true,
     "scale_problem": true,
-    "outer_iterations": 10,
-    "inner_iterations": 1000,
+    "sample_duration": 1,
+    "outer_iterations": 1,
+    "inner_iterations": 1,
     "tau": 0.8,
     "rho": 0.5,
     "rho_max": 5000,
     "alpha": 10,
     "batch_size": 100,
-    "hidden_sizes": [
-        500,
-        500
-    ],
+    "hidden_sizes": [500, 500],
     "primal_lr": 1e-4,
     "dual_lr": 1e-4,
     "decay": 0.99,

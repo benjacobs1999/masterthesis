@@ -4,17 +4,10 @@ import time
 from gep_config_parser import *
 from data_wrangling import dataframe_to_dict
 
-<<<<<<< HEAD
 from primal_dual import PrimalDualTrainer, load
-=======
-# from primal_dual import PrimalDualTrainer
->>>>>>> origin/main
 from gep_problem import GEPProblemSet
 from gep_problem_operational import GEPOperationalProblemSet
 from get_gurobi_vars import save_opt_targets
-from gep_benders import solve_matrix_problem
-from gep_benders import solve_matrix_problem_simple
-from gep_benders import solve_with_benders
 
 CONFIG_FILE_NAME        = "config.toml"
 VISUALIZATION_FILE_NAME = "visualization.toml"
@@ -37,7 +30,7 @@ def scale_dict(data_dict, scale_factor):
     return {key: value * scale_factor for key, value in data_dict.items()}
 
 
-def prep_data(args, inputs, target_path):
+def prep_data(args, inputs, target_path, operational=False):
     print("Wrangling the input data")
 
     # Extract sets
@@ -138,7 +131,7 @@ def prep_data(args, inputs, target_path):
 
 
     print("Creating problem instance")
-    if args["operational"]:
+    if operational:
         data = GEPOperationalProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, target_path=target_path)
     else:
         data = GEPProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, target_path=target_path)
@@ -178,7 +171,7 @@ if __name__ == "__main__":
             target_path = f"outputs/Gurobi/Operational={args['operational']}_T={args['sample_duration']}_{args['G']}"
 
             # Prep problem data:
-            data = prep_data(args=args, inputs=experiment_instance, target_path=target_path)
+            data = prep_data(args=args, inputs=experiment_instance, target_path=target_path, operational=args['operational'])
 
             # Run PDL
             trainer = PrimalDualTrainer(data, args, save_dir)
@@ -186,15 +179,6 @@ if __name__ == "__main__":
 
             primal_net, dual_net = load(data, save_dir)
 
-            # data.plot_balance(primal_net, dual_net)
-            # data.plot_decision_variable_diffs(primal_net, dual_net)
-
-            # Solve single sample with matrix formulation
-            sample = 1 # only solve first sample for now 
-            # solution = solve_matrix_problem(data, sample) # solution = Obj: 2374.99
-            # solution sample 1 = 2790.09
-
-            # Solve single sample with Benders decomposition
-            # sample = 0 # solution = Obj: 2374.99
-            solve_with_benders(data, sample)
+            data.plot_balance(primal_net, dual_net)
+            data.plot_decision_variable_diffs(primal_net, dual_net)
 
