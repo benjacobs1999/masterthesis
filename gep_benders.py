@@ -249,12 +249,19 @@ def find_benders_cut(data, compact, sample, investments, old_benders_cut, time_s
             # rhs is - dual * -investment
             benders_cut_rhs += - dual_val[-(data.num_g-g)]*-investments[g]
     else:
-        # Add dual term for inequalities #TODO can make it faster by skipping >=0 constraints, those terms are zero anyway
-        num_rows_per_t_ineq = 2 * (data.num_g + data.num_l + data.num_n) # lower and upper bounds for p_g, f_l and md_n and energy balance constraint
-        for constraint_nr in range(num_rows_per_t_ineq):
-            if constraint_nr < data.num_g or constraint_nr >= 2*data.num_g: # skip 3.1b constraints (right hand side is zero when investments are variable anyway)
-                benders_cut_rhs += -dual_val[constraint_nr] * b_ineq[constraint_nr]
+        # Create array of constraint nr's of inequalties of which we want to include the dual term (3.1d,3.1e,3.1j)
+        # because we only need to consider the constraints of which the rhs is not 0
+        constraint_nrs = []
+        constraint_nrs.extend([2*data.num_g+l for l in range(data.num_l)]) # 3.1d: Lineflow lower bound
+        constraint_nrs.extend([2*data.num_g+data.num_l+l for l in range(data.num_l)]) # 3.1e: Lineflow upper bound
+        constraint_nrs.extend([2*data.num_g+2*data.num_l+data.num_n+n for n in range(data.num_n)]) # 3.1j: Missed demand upper bound
+
+        # Add dual term for inequalities 
+        for constraint_nr in constraint_nrs:
+            benders_cut_rhs += -dual_val[constraint_nr] * b_ineq[constraint_nr]
+            
         # Add dual term for equalities
+        num_rows_per_t_ineq = 2 * (data.num_g + data.num_l + data.num_n) # lower and upper bounds for p_g, f_l and md_n
         for constraint_nr in range(data.num_n):
             benders_cut_rhs += -dual_val[num_rows_per_t_ineq+constraint_nr] * b_eq[constraint_nr]
     
@@ -306,7 +313,7 @@ def solve_with_benders(data, compact, sample):
 
         # Add Benders cut of current iteration to list
         benders_cut_all.append(benders_cut)
-        print('benders_cut',benders_cut)
+        print('Subproblems solved. Benders_cut:',benders_cut)
 
         # print('dual_val_all',dual_val_all)
 
