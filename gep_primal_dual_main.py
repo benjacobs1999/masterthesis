@@ -177,7 +177,7 @@ if __name__ == "__main__":
             trainer = PrimalDualTrainer(data, args, save_dir)
             primal_net, dual_net, stats = trainer.train_PDL()
 
-            primal_net, dual_net = load(data, save_dir)
+            # primal_net, dual_net = load(data, save_dir)
 
             data.plot_balance(primal_net, dual_net)
             data.plot_decision_variable_diffs(primal_net, dual_net)

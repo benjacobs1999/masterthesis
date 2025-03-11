@@ -99,14 +99,15 @@ class GEPOperationalProblemSet():
         self.eq_cm, self.eq_rhs = self.build_eq_cm_rhs()
         print("Creating objective coefficients")
         self.obj_coeff, self.obj_coeff_log = self.build_obj_coeff()
-        # self.X = self.build_X()
-        self.X = torch.concat([self.eq_rhs, self.ineq_rhs], dim=1)
+        self.X = self.build_X(self.eq_rhs, self.ineq_rhs)
+        # self.X = torch.concat([self.eq_rhs, self.ineq_rhs], dim=1)
         self.xdim = self.X.shape[1]
 
         # Split x into training, val, test sets.
         self._split_X_in_sets(self.train, self.valid, self.test)
 
         self.md_indices = self.get_md_nt_indices()
+        self.f_lt_indices = self.get_f_lt_indices()
     
     # Split the data
     @property
@@ -129,11 +130,21 @@ class GEPOperationalProblemSet():
         for i in range(self.sample_duration):
             # We have p_g and f_l first, then come the md_n.
             offset = i * self.n_var_per_t + self.num_g + self.num_l
-            indices_this_t = list(range(offset, offset + self.num_n))  # Convert range to list
-            indices.extend(indices_this_t)  # Use extend instead of += to avoid nested lists
+            indices_this_t = list(range(offset, offset + self.num_n))
+            indices.extend(indices_this_t)
         
         return indices
     
+    def get_f_lt_indices(self):
+        indices = []
+        for i in range(self.sample_duration):
+            # We have p_g first, then f_l.
+            offset = i * self.n_var_per_t + self.num_g
+            indices_this_t = list(range(offset, offset + self.num_l))
+            indices.extend(indices_this_t)
+        
+        return indices
+
     # TODO: Change for compact form!
     def split_ineq_constraints(self, ineq):
         """Groups the inequality [residuals or RHS] into constraints by constraint type.
@@ -259,7 +270,16 @@ class GEPOperationalProblemSet():
         # Take the absolute value of the missed demand in the obj function to penalize negative missed demand
         Y = Y.clone()
         Y[:, self.md_indices] = Y[:, self.md_indices].abs()
+        
         return self.obj_coeff @ Y.T
+    
+    def obj_fn_train(self, Y):
+        # Objective function adjusted for training (different than the actual objective function)
+        # Y = Y.clone()
+        # Y[:, self.md_indices] = Y[:, self.md_indices].abs()
+        reg_term_md = torch.norm(Y[:, self.md_indices], p=1, dim=1) #l1 regularization term
+        reg_term_f = torch.norm(Y[:, self.f_lt_indices], p=1, dim=1) #l1 regularization term
+        return self.obj_coeff @ Y.T + 0.1*(reg_term_md + reg_term_f)
     
     def obj_fn_log(self, Y):
         # obj_coeff does not need batching, objective is the same over different samples.
@@ -299,23 +319,23 @@ class GEPOperationalProblemSet():
         
         if self.benders_compact_form:
             c_compact = torch.cat((torch.zeros(self.num_g), c), 0)
+        else:
+            c_compact = c
 
         return c_compact, c
 
-    def build_X(self,):
-        # TODO: Change this when experimenting with different input features.
-        X = []
-        for time_range in self.time_ranges:
-            x = []
-            for n in self.N:
-                for t in time_range:
-                    x.append(self.pDemand[(n, t)])
-            for g in self.G:
-                for t in time_range:
-                    x.append(self.pGenAva.get((*g, t), 1.0))
-            X.append(x)
-        return torch.tensor(X)
+    def build_X(self, eq_rhs, ineq_rhs):
+        """Builds a tensor containing the features that vary across problem instances. For now, only supports changes in RHS.
+        """
+        # For ineq RHS, only 3.1b varies across instances --> first |G| constraints are 3.1h, second |G| constraints are 3.1b.
+        ineq_rhs_varying_indices = [t * self.n_ineq_per_t + self.num_g + i for t in range(self.sample_duration) for i in range(self.num_g)]
 
+        # The entire RHS changes for equality constraints
+        X = torch.concat([self.eq_rhs, self.ineq_rhs[:, ineq_rhs_varying_indices]], dim=1)
+
+        return X
+            
+                
     def build_ineq_cm_rhs(self,):
         ineq_cms = []
         ineq_rhss = []
@@ -480,18 +500,19 @@ class GEPOperationalProblemSet():
         return md_nt
 
     def plot_balance(self, primal_net, dual_net):
+        sample = 0
         with torch.no_grad():
             # Predictions for primal variables
             Y = primal_net(self.X[self.train_indices], self.eq_rhs[self.train_indices], self.ineq_rhs[self.train_indices])
             
             # Extract decision variables
             p_gt, f_lt, md_nt = self.split_dec_vars_from_Y(Y)  # [B, (G|L|N), T]
-            UI_g, D_nt = self.split_eq_constraints(self.eq_rhs[:1])  # [1, N, T]
+            UI_g, D_nt = self.split_eq_constraints(self.eq_rhs[sample:sample+1])  # [1, N, T]
             
             # Convert to numpy and ensure correct shape
-            total_prod = self.total_prod(p_gt[:1])[0].cpu().numpy()  # Shape [N, T], always positive
-            net_flow = self.net_flow(f_lt[:1])[0].cpu().numpy()  # Shape [N, T], can be positive or negative
-            missed_demand = md_nt[:1][0].cpu().numpy()  # Shape [N, T], can be positive or negative
+            total_prod = self.total_prod(p_gt[sample:sample+1])[0].cpu().numpy()  # Shape [N, T], always positive
+            net_flow = self.net_flow(f_lt[sample:sample+1])[0].cpu().numpy()  # Shape [N, T], can be positive or negative
+            missed_demand = md_nt[sample:sample+1][0].cpu().numpy()  # Shape [N, T], can be positive or negative
             demand = D_nt[0].cpu().numpy()  # Shape [N, T], total sum should match this
             
             num_nodes, num_timesteps = total_prod.shape
@@ -554,6 +575,7 @@ class GEPOperationalProblemSet():
             plt.show()
         
     def plot_decision_variable_diffs(self, primal_net, dual_net):
+        sample = 0
         with torch.no_grad():
             Y = primal_net(self.X[self.train_indices], self.eq_rhs[self.train_indices], self.ineq_rhs[self.train_indices])
             Y_target = self.opt_targets["y_operational"][self.train_indices]
@@ -596,9 +618,9 @@ class GEPOperationalProblemSet():
                 ax.axhline(0, color='black', linewidth=2)
                 ax.grid(True)
             
-            plot_variable(axes[0, 0], x_pos_g, x_labels_g, p_gt[0].reshape(-1), p_gt_target[0].reshape(-1), 'Primal Generation', 'blue')
-            plot_variable(axes[0, 1], x_pos_l, x_labels_l, f_lt[0].reshape(-1), f_lt_target[0].reshape(-1), 'Primal Line Flow', 'green')
-            plot_variable(axes[0, 2], x_pos_n, x_labels_n, md_nt[0].reshape(-1), md_nt_target[0].reshape(-1), 'Primal Missed Demand', 'orange')
+            plot_variable(axes[0, 0], x_pos_g, x_labels_g, p_gt[sample].reshape(-1), p_gt_target[sample].reshape(-1), 'Primal Generation', 'blue')
+            plot_variable(axes[0, 1], x_pos_l, x_labels_l, f_lt[sample].reshape(-1), f_lt_target[sample].reshape(-1), 'Primal Line Flow', 'green')
+            plot_variable(axes[0, 2], x_pos_n, x_labels_n, md_nt[sample].reshape(-1), md_nt_target[sample].reshape(-1), 'Primal Missed Demand', 'orange')
             
             def plot_dual_variable(ax, x_pos, labels, lb, ub, lb_target, ub_target, ylabel):
                 ax.bar(x_pos, lb, label='Dual LB', color='purple', alpha=0.5)
@@ -612,10 +634,10 @@ class GEPOperationalProblemSet():
                 ax.axhline(0, color='black', linewidth=2)
                 ax.grid(True)
             
-            plot_dual_variable(axes[1, 0], x_pos_g, x_labels_g, dual_lb_p[0].reshape(-1), dual_ub_p[0].reshape(-1), dual_target_lb_p[0].reshape(-1), dual_target_ub_p[0].reshape(-1), 'Dual (Gen)')
-            plot_dual_variable(axes[1, 1], x_pos_l, x_labels_l, dual_lb_f[0].reshape(-1), dual_ub_f[0].reshape(-1), dual_target_lb_f[0].reshape(-1), dual_target_ub_f[0].reshape(-1), 'Dual (Flow)')
-            plot_dual_variable(axes[1, 2], x_pos_n, x_labels_n, dual_lb_md[0].reshape(-1), dual_ub_md[0].reshape(-1), dual_target_lb_md[0].reshape(-1), dual_target_ub_md[0].reshape(-1), 'Dual (Missed Demand)')
-            plot_variable(axes[1, 3], x_pos_n, x_labels_n, dual_node_balance[0].reshape(-1), dual_node_balance_target[0].reshape(-1), 'Dual Node Balance', 'brown')
+            plot_dual_variable(axes[1, 0], x_pos_g, x_labels_g, dual_lb_p[sample].reshape(-1), dual_ub_p[sample].reshape(-1), dual_target_lb_p[sample].reshape(-1), dual_target_ub_p[sample].reshape(-1), 'Dual (Gen)')
+            plot_dual_variable(axes[1, 1], x_pos_l, x_labels_l, dual_lb_f[sample].reshape(-1), dual_ub_f[sample].reshape(-1), dual_target_lb_f[sample].reshape(-1), dual_target_ub_f[sample].reshape(-1), 'Dual (Flow)')
+            plot_dual_variable(axes[1, 2], x_pos_n, x_labels_n, dual_lb_md[sample].reshape(-1), dual_ub_md[sample].reshape(-1), dual_target_lb_md[sample].reshape(-1), dual_target_ub_md[sample].reshape(-1), 'Dual (Missed Demand)')
+            plot_variable(axes[1, 3], x_pos_n, x_labels_n, dual_node_balance[sample].reshape(-1), dual_node_balance_target[sample].reshape(-1), 'Dual Node Balance', 'brown')
             
             plt.tight_layout()
             plt.show()

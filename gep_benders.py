@@ -100,26 +100,28 @@ def solve_matrix_problem_simple(obj, A_ineq, b_ineq, A_eq, b_eq, master):
 
     return m.ObjVal, x.X, dual_val
 
-def solve_matrix_problem_PDL(primal_net, dual_net, obj, A_ineq, b_ineq, A_eq, b_eq):
+def solve_matrix_problem_PDL(data, primal_net, dual_net, obj, A_ineq, b_ineq, A_eq, b_eq):
     # Set objective
-    obj = np.array(obj)
+    # obj = torch.tensor(obj)
 
     # Add ineq constraints
-    ineq_cm = np.array(A_ineq)
-    ineq_rhs  = np.array(b_ineq)
+    ineq_cm = A_ineq.unsqueeze(0)
+    ineq_rhs  = b_ineq.unsqueeze(0)
 
     # Add eq constraints
-    eq_cm = np.array(A_eq)
-    eq_rhs = np.array(b_eq)
+    eq_cm = A_eq.unsqueeze(0)
+    eq_rhs = b_eq.unsqueeze(0)
 
-    x = torch.concat([torch.tensor(eq_rhs), torch.tensor(ineq_rhs)]).unsqueeze(0)
+    x = torch.concat([eq_rhs, ineq_rhs], dim=1)
 
     primal_val = primal_net(x, eq_rhs, ineq_rhs)
     dual_val = dual_net(x, eq_cm)
 
-    obj_val = obj @ primal_val
+    obj_val = obj @ primal_val.T
+    print(obj_val)
+    obj_val_from_data = data.obj_fn(primal_val)
 
-    return obj_val, primal_val, dual_val
+    return obj_val.item(), primal_val, dual_val
 
 def solve_master_problem(data,sample,investments,obj_val,dual_val):
     # Solves the master problem in Benders decomposition
@@ -210,10 +212,18 @@ def solve_subproblems(data,sample,investments, primal_net, dual_net):
         # Solve subproblem
         # obj_val, primal_val, dual_val = solve_matrix_problem_simple(obj, A_ineq, b_ineq, A_eq, b_eq, False)
 
-        obj_val, primal_val, dual_val = solve_matrix_problem_PDL(primal_net, dual_net, obj, A_ineq, b_ineq, A_eq, b_eq)
+        obj_val, primal_val, dual_val = solve_matrix_problem_PDL(data, primal_net, dual_net, obj, A_ineq, b_ineq, A_eq, b_eq)
+        obj_val_original, primal_val_original, dual_val_original = solve_matrix_problem_simple(obj, A_ineq, b_ineq, A_eq, b_eq, master=False)
+
+
+
+        print(f"Obj -- PDL: {obj_val}, original: {obj_val_original}")
+        # print(f"Obj PDL: {obj_val}")
 
         # Find dual variables of ui_g = investments constraint
-        dual_val = dual_val[-data.num_n:]
+        # dual_val = dual_val[-data.num_n:]
+        dual_val = dual_val[data.num_g:] #! Changed!
+
         dual_val_all.append(dual_val)
 
         # Find total objective value for cuts
@@ -369,8 +379,10 @@ if __name__ == "__main__":
             operational_data = prep_data(args=args, inputs=experiment_instance, target_path=target_path, operational=True)
 
             # Load primal and dual net
-            model_dir = "outputs/PDL/refactored_train:0.004_rho:0.5_rhomax:5000_alpha:10_L:10-1740750234-993448"
+            model_dir = "outputs/PDL/refactored_train:0.004_rho:0.5_rhomax:5000_alpha:10_L:10-1741007291-764719"
             primal_net, dual_net = load(operational_data, model_dir)
+
+            primal_net.eval(), dual_net.eval()
 
             # data.plot_balance(primal_net, dual_net)
             # data.plot_decision_variable_diffs(primal_net, dual_net)

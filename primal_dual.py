@@ -56,11 +56,12 @@ class TensorBoardLogger():
 
         self.writer.add_scalar(f"Train_loss/{network}_loss", loss, step)
 
-    def log_train(self, data, primal_net, dual_net, step):
+    def log_train(self, data, primal_net, dual_net, rho, step):
         with torch.no_grad():
             Y = primal_net(data.X[data.train_indices], data.eq_rhs[data.train_indices], data.ineq_rhs[data.train_indices])
             mu, lamb = dual_net(data.X[data.train_indices], data.eq_cm[data.train_indices])
-            obj = data.obj_fn(Y)
+            obj = data.obj_fn(Y) # Containes penalization of negative missed demand
+            obj_train = data.obj_fn_train(Y) # Does not penalize negative missed demand
             dual_obj = data.dual_obj_fn(data.eq_rhs[data.train_indices], data.ineq_rhs[data.train_indices], mu, lamb)
 
             Y_target = data.opt_targets["y_operational"][data.train_indices]
@@ -75,14 +76,27 @@ class TensorBoardLogger():
             eq_resid = data.eq_resid(Y, data.eq_cm[data.train_indices], data.eq_rhs[data.train_indices])
 
             obj_target = data.obj_fn_log(Y_target)
-            # dual_obj_target = data.dual_obj_fn(data.eq_rhs[data.train_indices], data.ineq_rhs[data.train_indices], mu_target, lamb_target)
-            dual_obj_target = obj_target # With LP, there is strong duality, so dual obj = primal obj.
+            dual_obj_target = data.dual_obj_fn(data.eq_rhs[data.train_indices], data.ineq_rhs[data.train_indices], mu_target, lamb_target)
+            # dual_obj_target = obj_target # With LP, there is strong duality, so dual obj = primal obj.
+
+            # Loss components
+            # lagrange_ineq = torch.sum(mu * ineq_resid, dim=1)  # Shape (batch_size,)
+            lagrange_ineq = torch.sum(mu * ineq_resid, dim=1).clamp(min=0)  # Shape (batch_size,)
+            lagrange_eq = torch.sum(lamb * eq_resid, dim=1)   # Shape (batch_size,)
+            violation_ineq = torch.sum(torch.maximum(ineq_resid, torch.zeros_like(ineq_resid)) ** 2, dim=1)
+            violation_eq = torch.sum(eq_resid ** 2, dim=1)
+            penalty = rho/2 * (violation_ineq + violation_eq)
+            self.writer.add_scalar(f"Train_loss_components/obj_train", obj_train.mean(), step)
+            self.writer.add_scalar(f"Train_loss_components/primal_lagrange_ineq", lagrange_ineq.mean(), step)
+            self.writer.add_scalar(f"Train_loss_components/primal_lagrange_eq", lagrange_eq.mean(), step)
+            self.writer.add_scalar(f"Train_loss_components/primal_penalty_term", penalty.mean(), step)
+
 
             # Obj funcs
             self.writer.add_scalar(f"Train_obj/obj", obj.mean(), step)
             self.writer.add_scalar(f"Train_obj/dual_obj", dual_obj.mean(), step)
             self.writer.add_scalar(f"Train_obj/obj_optimality_gap", ((obj - obj_target)/obj_target).mean(), step)
-            self.writer.add_scalar(f"Train_obj/dual_obj_optimality_gap", ((dual_obj - dual_obj_target)/dual_obj_target).mean(), step)
+            self.writer.add_scalar(f"Train_obj/dual_obj_optimality_gap", (-(dual_obj - dual_obj_target)/dual_obj_target).mean(), step)
 
             # Neural network outputs and targets
             if data.args["benders_compact"]:
@@ -114,24 +128,29 @@ class TensorBoardLogger():
             diff_f_lt = f_lt - f_lt_target
             diff_md_nt = md_nt - md_nt_target
 
+            net_flow = data.net_flow(f_lt)
+            net_flow_target = data.net_flow(f_lt_target)
+            diff_net_flow = net_flow - net_flow_target
+
             # diff_ui_g = (Y[:, data.ui_g_indices] - Y_target[:, data.ui_g_indices])
-            self.writer.add_scalar(f"Train_var_diffs/diff_p_gt", diff_p_gt.mean(), step)
-            self.writer.add_scalar(f"Train_var_diffs/diff_f_lt", diff_f_lt.mean(), step)
-            self.writer.add_scalar(f"Train_var_diffs/diff_md_nt", diff_md_nt.mean(), step)
+            self.writer.add_scalar(f"Train_var_diffs/diff_p_gt", diff_p_gt.abs().mean(), step)
+            self.writer.add_scalar(f"Train_var_diffs/diff_f_lt", diff_f_lt.abs().mean(), step)
+            self.writer.add_scalar(f"Train_var_diffs/diff_md_nt", diff_md_nt.abs().mean(), step)
+            self.writer.add_scalar(f"Train_var_diffs/diff_net_flow", diff_net_flow.abs().mean(), step)
             # self.writer.add_scalar(f"Train_var_diffs/diff_ui_g", diff_ui_g.mean(), step)
 
             h, b, d, e, i, j = data.split_ineq_constraints(ineq_dist)
             ui_g, c = data.split_eq_constraints(eq_resid)
 
-            self.writer.add_scalar(f"Train_constraint_specific/p_gt_ub", b.mean(), step)
-            self.writer.add_scalar(f"Train_constraint_specific/node_balance", c.mean(), step)
-            self.writer.add_scalar(f"Train_constraint_specific/f_lt_lb", d.mean(), step)
-            self.writer.add_scalar(f"Train_constraint_specific/f_lt_ub", e.mean(), step)
+            self.writer.add_scalar(f"Train_constraint_specific/p_gt_ub", b.abs().mean(), step)
+            self.writer.add_scalar(f"Train_constraint_specific/node_balance", c.abs().mean(), step)
+            self.writer.add_scalar(f"Train_constraint_specific/f_lt_lb", d.abs().mean(), step)
+            self.writer.add_scalar(f"Train_constraint_specific/f_lt_ub", e.abs().mean(), step)
             # self.writer.add_scalar(f"Train_constraint_specific/f", f.mean(), step)
             # self.writer.add_scalar(f"Train_constraint_specific/g", g.mean(), step)
-            self.writer.add_scalar(f"Train_constraint_specific/p_gt_lb", h.mean(), step)
-            self.writer.add_scalar(f"Train_constraint_specific/md_nt_lb", i.mean(), step)
-            self.writer.add_scalar(f"Train_constraint_specific/md_nt_ub", j.mean(), step)
+            self.writer.add_scalar(f"Train_constraint_specific/p_gt_lb", h.abs().mean(), step)
+            self.writer.add_scalar(f"Train_constraint_specific/md_nt_lb", i.abs().mean(), step)
+            self.writer.add_scalar(f"Train_constraint_specific/md_nt_ub", j.abs().mean(), step)
             # self.writer.add_scalar(f"Train_constraint_specific/k", k.mean(), step)
 
             # Dual variable specific differences
@@ -304,7 +323,7 @@ class PrimalDualTrainer():
                     # Logg training loss:
                     with torch.no_grad():
                         self.logger.log_loss(batch_loss, "primal", self.step)
-                        self.logger.log_train(self.data, primal_net=self.primal_net, dual_net=frozen_dual_net, step=self.step)
+                        self.logger.log_train(self.data, primal_net=self.primal_net, dual_net=frozen_dual_net, rho=self.rho, step=self.step)
 
                     # Evaluate validation loss every epoch, and update learning rate
                     # with torch.no_grad():
@@ -360,7 +379,7 @@ class PrimalDualTrainer():
                     with torch.no_grad():
                         # Logg training loss:
                         self.logger.log_loss(batch_loss, "dual", self.step)
-                        self.logger.log_train(self.data, primal_net=frozen_primal_net, dual_net=self.dual_net, step=self.step)
+                        self.logger.log_train(self.data, primal_net=frozen_primal_net, dual_net=self.dual_net, rho=self.rho, step=self.step)
 
                     # Evaluate validation loss every epoch, and update learning rate
                     # TODO! Does scheduler correctly decrease LR when rho is increased, if the training set is small?
@@ -405,7 +424,7 @@ class PrimalDualTrainer():
         return self.primal_net, self.dual_net, stats
 
     def primal_loss(self, y, eq_cm, ineq_cm, eq_rhs, ineq_rhs, mu, lamb):
-        obj = self.data.obj_fn(y)
+        obj = self.data.obj_fn_train(y)
         
         # g(y)
         ineq = self.data.ineq_resid(y, ineq_cm, ineq_rhs)
@@ -418,7 +437,9 @@ class PrimalDualTrainer():
         # ! Clamp ineq_resid?
         # ineq = ineq.clamp(min=0)
 
-        lagrange_ineq = torch.sum(mu * ineq, dim=1)  # Shape (batch_size,)
+        # lagrange_ineq = torch.sum(mu * ineq, dim=1)  # Shape (batch_size,)
+        # ! Clamp the lagrangian inequality term --> we do not adhere to KKT (why not?)
+        lagrange_ineq = torch.sum(mu * ineq, dim=1).clamp(min=0)  # Shape (batch_size,)
 
         lagrange_eq = torch.sum(lamb * eq, dim=1)   # Shape (batch_size,)
 
@@ -426,8 +447,12 @@ class PrimalDualTrainer():
         violation_eq = torch.sum(eq ** 2, dim=1)
         penalty = self.rho/2 * (violation_ineq + violation_eq)
 
-        # ! Primal loss needs to be scaled to work.
-        loss = (obj*1e3 + (lagrange_ineq + lagrange_eq + penalty))
+        # ! Primal loss might need to be scaled to work.
+        # loss = (obj*1e3 + (lagrange_ineq + lagrange_eq + penalty))
+        loss = (obj + (lagrange_ineq + lagrange_eq + penalty))
+
+        #! Test only optimizing objective.
+        # loss = obj
 
         return loss
 
@@ -462,21 +487,9 @@ class PrimalDualTrainer():
         #! We maximize the dual obj func, so to use it in the loss, take the negation.
         dual_obj = -self.data.dual_obj_fn(eq_rhs, ineq_rhs, mu, lamb)
 
-        #! Enforced with ReLU.
-        # ineq = self.data.dual_ineq_resid(mu, lamb)
 
-        eq = self.data.dual_eq_resid(mu, lamb, eq_cm, ineq_cm)
-        # Lagrange multiplier becomes y
-        lagrange_eq = torch.sum(y * eq, dim=1)
-
-        violation_eq = torch.sum(eq ** 2, dim=1)
-
-        penalty = self.rho/2 * violation_eq
-
-        loss = dual_obj + lagrange_eq + penalty
-        # loss = dual_obj + penalty
-
-        return loss
+        #! Dual constraints are never violated, so we do not include penalty and lagrangian terms.
+        return dual_obj
 
     def violation(self, y, eq_cm, ineq_cm, eq_rhs, ineq_rhs, mu_k):
         # Calculate the equality constraint function h_x(y)
@@ -545,20 +558,21 @@ class DualNetEndToEnd(nn.Module):
 
         #! Only predict lambda, we infer mu from it.
         self.feed_forward = FeedForwardNet(data.xdim, self._hidden_sizes, output_dim=self._out_dim)
-        
-        
-    def forward(self, x, eq_cm):
-        out_lamb = self.feed_forward(x)
 
-        # first num_g outputs are the equality constraints added in benders compact form
+        # Set dual variables to 0 at the first iteration
+        nn.init.zeros_(self.feed_forward.net[-1].weight)  # Initialize output layer weights to 0
+        nn.init.zeros_(self.feed_forward.net[-1].bias)    # Initialize output layer biases to 0
+    
+    def complete_duals(self, lamb, eq_cm):
+         # first num_g outputs are the equality constraints added in benders compact form
         if self._data.args["benders_compact"]:
             # lamb_ui_g = out_lamb[:, :self._data.num_g]
-            lamb_D_nt = out_lamb[:, self._data.num_g:]
+            lamb_D_nt = lamb[:, self._data.num_g:]
             eq_cm_D_nt = eq_cm[:, self._data.num_g:, self._data.num_g:]
             obj_coeff = self._data.obj_coeff[self._data.num_g:]
         else:
             eq_cm_D_nt = eq_cm
-            lamb_D_nt = out_lamb
+            lamb_D_nt = lamb
             obj_coeff = self._data.obj_coeff
 
         mu = obj_coeff - torch.bmm(eq_cm_D_nt.transpose(1, 2), lamb_D_nt.unsqueeze(-1)).squeeze(-1)
@@ -568,6 +582,9 @@ class DualNetEndToEnd(nn.Module):
         # Compute lower and upper bound multipliers
         mu_lb = torch.relu(mu)   # Lower bound multipliers |mu|^+
         mu_ub = torch.relu(-mu)  # Upper bound multipliers |mu|^-
+
+        # mu_lb = mu * (mu > 0).float().detach()
+        # mu_ub = -mu * (mu < 0).float().detach()
 
         # Split into groups, following the exact structure of mu
         p_g_lb = mu_lb[:, :, :self._data.num_g]  # Lower bounds for p_g
@@ -585,6 +602,13 @@ class DualNetEndToEnd(nn.Module):
             f_l_lb, f_l_ub,  # Lower and Upper bounds for f_l
             md_n_lb, md_n_ub  # Lower and Upper bounds for md_n
         ], dim=-1).reshape(mu.shape[0], -1)  # Flatten back to (batch_size, constraints * t)
+
+        return out_mu
+        
+        
+    def forward(self, x, eq_cm):
+        out_lamb = self.feed_forward(x)
+        out_mu = self.complete_duals(out_lamb, eq_cm)
 
         return out_mu, out_lamb
 
@@ -699,7 +723,7 @@ class BoundRepairLayer(nn.Module):
     def __init__(self):
         super().__init__()
     
-    def forward(self, x, lb, ub):
+    def forward(self, x, lb, ub, k=5):
         """_summary_
 
         Args:
@@ -711,7 +735,7 @@ class BoundRepairLayer(nn.Module):
             _type_: _description_
         """
 
-        return lb + (ub - lb) * torch.sigmoid(x)
+        return lb + (ub - lb) * torch.sigmoid(k*x)
         # return torch.clamp(x, lb, ub)
         # return (lb + (ub - lb)/2 * (torch.tanh(x) + 1))
 
@@ -744,7 +768,7 @@ class EstimateSlackLayer(nn.Module):
 
 class PrimalNetEndToEnd(nn.Module):
         # TODO! Validate the repair layers in a jupyter notebook!
-        def __init__(self, data, n_size_factor=1.5, n_layers=4):
+        def __init__(self, data, n_size_factor=10, n_layers=4):
             super().__init__()
             self._data = data
             self._hidden_sizes = [int(n_size_factor*data.xdim)] * n_layers
