@@ -163,3 +163,12 @@ cython_debug/
 
 #! Added myself:
 .DS_STORE
+outputs/PDL/
+outputs/PDL_benchmark/
+outputs/QP_experiments/
+outputs/Gurobi/output.txt
+benchmark_experiment_output/
+output_figures/
+reproduction-experiments/tensorboard_logs/
+results/
+boosting-crossover-with-ai/

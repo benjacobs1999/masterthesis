@@ -2,8 +2,18 @@ import gurobipy as gp
 from gurobipy import GRB
 import numpy as np
 import torch
+import json
+import pickle
+import pandas as pd
+import time
+
 from gep_problem import GEPProblemSet
 from gep_problem_operational import GEPOperationalProblemSet
+from gep_primal_dual_main import prep_data
+from primal_dual import load
+from gep_config_parser import *
+
+CONFIG_FILE_NAME        = "config.toml"
 
 def solve_matrix_problem(data,i):
 
@@ -90,6 +100,29 @@ def solve_matrix_problem_simple(obj, A_ineq, b_ineq, A_eq, b_eq, master):
 
     return m.ObjVal, x.X, dual_val
 
+def solve_matrix_problem_PDL(data, primal_net, dual_net, obj, A_ineq, b_ineq, A_eq, b_eq):
+    # Set objective
+    # obj = torch.tensor(obj)
+
+    # Add ineq constraints
+    ineq_cm = A_ineq.unsqueeze(0)
+    ineq_rhs  = b_ineq.unsqueeze(0)
+
+    # Add eq constraints
+    eq_cm = A_eq.unsqueeze(0)
+    eq_rhs = b_eq.unsqueeze(0)
+
+    x = torch.concat([eq_rhs, ineq_rhs], dim=1)
+
+    primal_val = primal_net(x, eq_rhs, ineq_rhs)
+    dual_val = dual_net(x, eq_cm)
+
+    obj_val = obj @ primal_val.T
+    print(obj_val)
+    obj_val_from_data = data.obj_fn(primal_val)
+
+    return obj_val.item(), primal_val, dual_val
+  
 def solve_master_problem(data,compact,sample,investments,obj_val,benders_cuts):
     # Solves the master problem in Benders decomposition
     # Returns the optimal objective function value in two parts: investment costs and value of alpha
@@ -162,7 +195,15 @@ def solve_subproblems(data,compact,sample,investments):
         obj, A_ineq, b_ineq, A_eq, b_eq = find_subproblem_cm_rhs_obj(data,compact,sample,investments,time_step)
 
         # Solve subproblem
-        obj_val, primal_val, dual_val = solve_matrix_problem_simple(obj, A_ineq, b_ineq, A_eq, b_eq, False)
+        # obj_val, primal_val, dual_val = solve_matrix_problem_simple(obj, A_ineq, b_ineq, A_eq, b_eq, False)
+
+        obj_val, primal_val, dual_val = solve_matrix_problem_PDL(data, primal_net, dual_net, obj, A_ineq, b_ineq, A_eq, b_eq)
+        obj_val_original, primal_val_original, dual_val_original = solve_matrix_problem_simple(obj, A_ineq, b_ineq, A_eq, b_eq, master=False)
+
+
+
+        print(f"Obj -- PDL: {obj_val}, original: {obj_val_original}")
+        # print(f"Obj PDL: {obj_val}")
 
         # Add objective value to the total
         obj_val_total += obj_val
@@ -269,7 +310,7 @@ def find_benders_cut(data, compact, sample, investments, old_benders_cut, time_s
 
     return new_benders_cut
 
-def solve_with_benders(data, compact, sample):
+def solve_with_benders(data, compact, sample, primal_net, dual_net):
 
     # Create lists for algorithm
     investments_all = [] # list of tensors of size (num_g), one for every iteration
@@ -306,7 +347,7 @@ def solve_with_benders(data, compact, sample):
         investments_all.append(investments_iter_k)
 
         # Solve subproblems to find new cuts
-        obj_val_total, benders_cut  = solve_subproblems(data,compact,sample,investments_iter_k)
+        obj_val_total, dual_val_all  = solve_subproblems(data,compact,sample,investments_iter_k, primal_net, dual_net)
 
         # Add total objective value of all subproblems of current iteration together to list
         obj_val_subproblems_all.append(obj_val_total)
@@ -318,10 +359,11 @@ def solve_with_benders(data, compact, sample):
         # print('dual_val_all',dual_val_all)
 
         # Check for optimality
-        lower_bound = obj_val_master[0] + obj_val_master[1]
+        lower_bound = obj_val_master[0] + obj_val_master[1] 
         upper_bound = obj_val_master[0] + obj_val_total
         print("Upper bound:",upper_bound)
         print("Lower bound",lower_bound)
+        #TODO: Should we keep track of a best upper bound? The upper bound is not strictly better each iteration, it seems.
         if upper_bound - lower_bound < epsilon:
             optimal = True
             print('Done! Optimal solution found')
@@ -331,3 +373,55 @@ def solve_with_benders(data, compact, sample):
         iter += 1
         
     return
+
+if __name__ == "__main__":
+        ## Step 1: parse the input data
+    print("Parsing the config file")
+
+    data = parse_config(CONFIG_FILE_NAME)
+    experiment = data["experiment"]
+    outputs_config = data["outputs_config"]
+
+    with open("config.json", "r") as file:
+        args = json.load(file)
+    
+    print(args)
+
+    # Train the model:
+    for i, experiment_instance in enumerate(experiment["experiments"]):
+        # Setup output dataframe
+        df_res = pd.DataFrame(columns=["setup_time", "presolve_time", "barrier_time", "crossover_time", "restore_time", "objective_value"])
+
+        for j in range(experiment["repeats"]):
+            # Run one experiment for j repeats
+            run_name = f"refactored_train:{args['train']}_rho:{args['rho']}_rhomax:{args['rho_max']}_alpha:{args['alpha']}_L:{args['alpha']}"
+            # save_dir = os.path.join('outputs', 'PDL',
+            #     run_name + "-" + str(time.time()).replace('.', '-'))
+            # if not os.path.exists(save_dir):
+            #     os.makedirs(save_dir)
+            # with open(os.path.join(save_dir, 'args.dict'), 'wb') as f:
+            #     pickle.dump(args, f)
+
+            target_path = f"outputs/Gurobi/Operational={True}_T={args['sample_duration']}_{args['G']}"
+
+            # Prep problem data:
+            gep_data = prep_data(args=args, inputs=experiment_instance, target_path=target_path, operational=False)
+            operational_data = prep_data(args=args, inputs=experiment_instance, target_path=target_path, operational=True)
+
+            # Load primal and dual net
+            model_dir = "outputs/PDL/refactored_train:0.004_rho:0.5_rhomax:5000_alpha:10_L:10-1741007291-764719"
+            primal_net, dual_net = load(operational_data, model_dir)
+
+            primal_net.eval(), dual_net.eval()
+
+            # data.plot_balance(primal_net, dual_net)
+            # data.plot_decision_variable_diffs(primal_net, dual_net)
+
+            # Solve single sample with matrix formulation
+            # sample = 1 # only solve first sample for now 
+            # solution = solve_matrix_problem(data, sample) # solution = Obj: 2374.99
+            # solution sample 1 = 2790.09
+
+            # Solve single sample with Benders decomposition
+            sample = 0 # solution = Obj: 2374.99
+            solve_with_benders(gep_data, sample, primal_net, dual_net)

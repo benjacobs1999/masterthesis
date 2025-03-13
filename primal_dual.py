@@ -12,7 +12,7 @@ import numpy as np
 DTYPE = torch.float64
 DEVICE = torch.device="cpu"
 torch.autograd.set_detect_anomaly(True)
-torch.manual_seed(42)
+# torch.manual_seed(42)
 print(f"Running on {DEVICE}")
 
 class CustomDataset(torch.utils.data.Dataset):
@@ -56,11 +56,12 @@ class TensorBoardLogger():
 
         self.writer.add_scalar(f"Train_loss/{network}_loss", loss, step)
 
-    def log_train(self, data, primal_net, dual_net, step):
+    def log_train(self, data, primal_net, dual_net, rho, step):
         with torch.no_grad():
             Y = primal_net(data.X[data.train_indices], data.eq_rhs[data.train_indices], data.ineq_rhs[data.train_indices])
             mu, lamb = dual_net(data.X[data.train_indices], data.eq_cm[data.train_indices])
-            obj = data.obj_fn(Y)
+            obj = data.obj_fn(Y) # Containes penalization of negative missed demand
+            obj_train = data.obj_fn_train(Y) # Does not penalize negative missed demand
             dual_obj = data.dual_obj_fn(data.eq_rhs[data.train_indices], data.ineq_rhs[data.train_indices], mu, lamb)
 
             Y_target = data.opt_targets["y_operational"][data.train_indices]
@@ -74,19 +75,37 @@ class TensorBoardLogger():
 
             eq_resid = data.eq_resid(Y, data.eq_cm[data.train_indices], data.eq_rhs[data.train_indices])
 
-            obj_target = data.obj_fn(Y_target)
+            obj_target = data.obj_fn_log(Y_target)
             dual_obj_target = data.dual_obj_fn(data.eq_rhs[data.train_indices], data.ineq_rhs[data.train_indices], mu_target, lamb_target)
+            # dual_obj_target = obj_target # With LP, there is strong duality, so dual obj = primal obj.
+
+            # Loss components
+            # lagrange_ineq = torch.sum(mu * ineq_resid, dim=1)  # Shape (batch_size,)
+            lagrange_ineq = torch.sum(mu * ineq_resid, dim=1)  # Shape (batch_size,)
+            lagrange_eq = torch.sum(lamb * eq_resid, dim=1)   # Shape (batch_size,)
+            violation_ineq = torch.sum(torch.maximum(ineq_resid, torch.zeros_like(ineq_resid)) ** 2, dim=1)
+            violation_eq = torch.sum(eq_resid ** 2, dim=1)
+            penalty = rho/2 * (violation_ineq + violation_eq)
+            self.writer.add_scalar(f"Train_loss_components/obj_train", obj_train.mean(), step)
+            self.writer.add_scalar(f"Train_loss_components/primal_lagrange_ineq", lagrange_ineq.mean(), step)
+            self.writer.add_scalar(f"Train_loss_components/primal_lagrange_eq", lagrange_eq.mean(), step)
+            self.writer.add_scalar(f"Train_loss_components/primal_penalty_term", penalty.mean(), step)
+
 
             # Obj funcs
             self.writer.add_scalar(f"Train_obj/obj", obj.mean(), step)
             self.writer.add_scalar(f"Train_obj/dual_obj", dual_obj.mean(), step)
             self.writer.add_scalar(f"Train_obj/obj_optimality_gap", ((obj - obj_target)/obj_target).mean(), step)
-            self.writer.add_scalar(f"Train_obj/dual_obj_optimality_gap", ((dual_obj - dual_obj_target)/dual_obj_target).mean(), step)
+            self.writer.add_scalar(f"Train_obj/dual_obj_optimality_gap", (-(dual_obj - dual_obj_target)/dual_obj_target).mean(), step)
 
             # Neural network outputs and targets
-            Y_diff = (Y - Y_target).abs()
+            if data.args["benders_compact"]:
+                Y_diff = (Y[:, data.num_g:] - Y_target).abs()
+                lamb_diff = (lamb[:, data.num_g:] - lamb_target).abs()
+            else:
+                Y_diff = (Y - Y_target).abs()
+                lamb_diff = (lamb - lamb_target).abs()
             mu_diff = (mu - mu_target).abs()
-            lamb_diff = (lamb - lamb_target).abs()
             self.writer.add_scalar(f"Train_outputs/Y", Y.mean(), step)
             self.writer.add_scalar(f"Train_outputs/mu", mu.mean(), step)
             self.writer.add_scalar(f"Train_outputs/lamb", lamb.mean(), step)
@@ -104,29 +123,34 @@ class TensorBoardLogger():
 
             # Primal variable specific differences
             p_gt, f_lt, md_nt = data.split_dec_vars_from_Y(Y)
-            p_gt_target, f_lt_target, md_nt_target = data.split_dec_vars_from_Y(Y_target)
+            p_gt_target, f_lt_target, md_nt_target = data.split_dec_vars_from_Y(Y_target, log=True)
             diff_p_gt = p_gt - p_gt_target
             diff_f_lt = f_lt - f_lt_target
             diff_md_nt = md_nt - md_nt_target
 
+            net_flow = data.net_flow(f_lt)
+            net_flow_target = data.net_flow(f_lt_target)
+            diff_net_flow = net_flow - net_flow_target
+
             # diff_ui_g = (Y[:, data.ui_g_indices] - Y_target[:, data.ui_g_indices])
-            self.writer.add_scalar(f"Train_var_diffs/diff_p_gt", diff_p_gt.mean(), step)
-            self.writer.add_scalar(f"Train_var_diffs/diff_f_lt", diff_f_lt.mean(), step)
-            self.writer.add_scalar(f"Train_var_diffs/diff_md_nt", diff_md_nt.mean(), step)
+            self.writer.add_scalar(f"Train_var_diffs/diff_p_gt", diff_p_gt.abs().mean(), step)
+            self.writer.add_scalar(f"Train_var_diffs/diff_f_lt", diff_f_lt.abs().mean(), step)
+            self.writer.add_scalar(f"Train_var_diffs/diff_md_nt", diff_md_nt.abs().mean(), step)
+            self.writer.add_scalar(f"Train_var_diffs/diff_net_flow", diff_net_flow.abs().mean(), step)
             # self.writer.add_scalar(f"Train_var_diffs/diff_ui_g", diff_ui_g.mean(), step)
 
             h, b, d, e, i, j = data.split_ineq_constraints(ineq_dist)
-            c = data.split_eq_constraints(eq_resid)
+            ui_g, c = data.split_eq_constraints(eq_resid)
 
-            self.writer.add_scalar(f"Train_constraint_specific/p_gt_ub", b.mean(), step)
-            self.writer.add_scalar(f"Train_constraint_specific/node_balance", c.mean(), step)
-            self.writer.add_scalar(f"Train_constraint_specific/f_lt_lb", d.mean(), step)
-            self.writer.add_scalar(f"Train_constraint_specific/f_lt_ub", e.mean(), step)
+            self.writer.add_scalar(f"Train_constraint_specific/p_gt_ub", b.abs().mean(), step)
+            self.writer.add_scalar(f"Train_constraint_specific/node_balance", c.abs().mean(), step)
+            self.writer.add_scalar(f"Train_constraint_specific/f_lt_lb", d.abs().mean(), step)
+            self.writer.add_scalar(f"Train_constraint_specific/f_lt_ub", e.abs().mean(), step)
             # self.writer.add_scalar(f"Train_constraint_specific/f", f.mean(), step)
             # self.writer.add_scalar(f"Train_constraint_specific/g", g.mean(), step)
-            self.writer.add_scalar(f"Train_constraint_specific/p_gt_lb", h.mean(), step)
-            self.writer.add_scalar(f"Train_constraint_specific/md_nt_lb", i.mean(), step)
-            self.writer.add_scalar(f"Train_constraint_specific/md_nt_ub", j.mean(), step)
+            self.writer.add_scalar(f"Train_constraint_specific/p_gt_lb", h.abs().mean(), step)
+            self.writer.add_scalar(f"Train_constraint_specific/md_nt_lb", i.abs().mean(), step)
+            self.writer.add_scalar(f"Train_constraint_specific/md_nt_ub", j.abs().mean(), step)
             # self.writer.add_scalar(f"Train_constraint_specific/k", k.mean(), step)
 
             # Dual variable specific differences
@@ -141,8 +165,8 @@ class TensorBoardLogger():
             mu_j_diff = mu_target_j - mu_j
 
             # # equality
-            lamb_c = data.split_eq_constraints(lamb)
-            lamb_target_c = data.split_eq_constraints(lamb_target)
+            ui_g, lamb_c = data.split_eq_constraints(lamb)
+            ui_g, lamb_target_c = data.split_eq_constraints(lamb_target, log=True)
             lamb_c_diff = lamb_target_c - lamb_c
 
             self.writer.add_scalar(f"Train_dual_var_diffs/gen_ub", mu_b_diff.mean(), step)
@@ -169,15 +193,46 @@ class TensorBoardLogger():
             for name, param in primal_net.named_parameters():
                 if param.grad is not None:  # Skip parameters without gradients
                     self.writer.add_scalar(f"Gradients_primal/{name}", param.grad.norm().item(), step)
-            # self.writer.add_scalar(f"Gradient/dual", dual_net[-1].weight.grad.mean())
+            
+            for name, param in dual_net.named_parameters():
+                if param.grad is not None:  # Skip parameters without gradients
+                    self.writer.add_scalar(f"Gradients_dual/{name}", param.grad.norm().item(), step)
 
     def log_rho_vk(self, rho, v_k, step):
         self.writer.add_scalar(f"Rho_and_violation/rho", rho, step)
         self.writer.add_scalar(f"Rho_and_violation/v_k", v_k, step)
 
-    def log_val(self, data, primal_net, dual_net):
-        pass
-    
+    def log_val(self, data, primal_net, dual_net, step):
+        with torch.no_grad():
+            Y = primal_net(data.X[data.valid_indices], data.eq_rhs[data.valid_indices], data.ineq_rhs[data.valid_indices])
+            mu, lamb = dual_net(data.X[data.valid_indices], data.eq_cm[data.valid_indices])
+            obj = data.obj_fn(Y) # Containes penalization of negative missed demand
+            obj_train = data.obj_fn_train(Y) # Does not penalize negative missed demand
+            dual_obj = data.dual_obj_fn(data.eq_rhs[data.valid_indices], data.ineq_rhs[data.valid_indices], mu, lamb)
+
+            Y_target = data.opt_targets["y_operational"][data.valid_indices]
+            mu_target = data.opt_targets["mu_operational"][data.valid_indices]
+            lamb_target = data.opt_targets["lamb_operational"][data.valid_indices]
+
+            # print(Y[0, 5*14:5*15].tolist())
+
+            ineq_resid = data.ineq_resid(Y, data.ineq_cm[data.valid_indices], data.ineq_rhs[data.valid_indices])
+            ineq_dist = data.ineq_dist(Y, data.ineq_cm[data.valid_indices], data.ineq_rhs[data.valid_indices])
+
+            eq_resid = data.eq_resid(Y, data.eq_cm[data.valid_indices], data.eq_rhs[data.valid_indices])
+
+            obj_target = data.obj_fn_log(Y_target)
+            dual_obj_target = data.dual_obj_fn(data.eq_rhs[data.valid_indices], data.ineq_rhs[data.valid_indices], mu_target, lamb_target)
+            # Obj funcs
+            self.writer.add_scalar(f"Validation/obj", obj.mean(), step)
+            self.writer.add_scalar(f"Validation/dual_obj", dual_obj.mean(), step)
+            self.writer.add_scalar(f"Validation/obj_optimality_gap", ((obj - obj_target)/obj_target).mean(), step)
+            self.writer.add_scalar(f"Validation/dual_obj_optimality_gap", (-(dual_obj - dual_obj_target)/dual_obj_target).mean(), step)
+            # Constraint violations
+            self.writer.add_scalar(f"Validation/ineq_mean", ineq_dist.mean(), step)
+            self.writer.add_scalar(f"Validation/ineq_max", ineq_dist.max(), step)
+            self.writer.add_scalar(f"Validation/eq_mean", eq_resid.abs().mean(), step)
+            self.writer.add_scalar(f"Validation/eq_max", eq_resid.abs().max(), step)
         
 class PrimalDualTrainer():
 
@@ -241,15 +296,14 @@ class PrimalDualTrainer():
         # self.valid_dataset = CustomDataset(X[valid].to(DEVICE), eq_cm[valid], ineq_cm[valid], eq_rhs[valid], ineq_rhs[valid])
         # self.test_dataset = TensorDataset(self.data.testX.to(DEVICE), self.data.testX_scaled.to(DEVICE))
 
-        # self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
-        self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=False)
+        self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
         # self.valid_loader = DataLoader(self.valid_dataset, batch_size=len(self.valid_dataset))
         # self.test_loader = DataLoader(self.test_dataset, batch_size=len(self.test_dataset))
 
         # self.primal_net = PrimalNet(self.data, self.hidden_sizes).to(dtype=DTYPE, device=DEVICE)
         self.primal_net = PrimalNetEndToEnd(self.data).to(dtype=DTYPE, device=DEVICE)
-        self.dual_net = DualNet(self.data, self.hidden_sizes, self.data.nineq, self.data.neq).to(dtype=DTYPE, device=DEVICE)
-        # self.dual_net = DualNetEndToEnd(self.data).to(dtype=DTYPE, device=DEVICE)
+        # self.dual_net = DualNet(self.data, self.hidden_sizes, self.data.nineq, self.data.neq).to(dtype=DTYPE, device=DEVICE)
+        self.dual_net = DualNetEndToEnd(self.data).to(dtype=DTYPE, device=DEVICE)
 
         self.primal_optim = torch.optim.Adam(self.primal_net.parameters(), lr=self.primal_lr)
         self.dual_optim = torch.optim.Adam(self.dual_net.parameters(), lr=self.dual_lr)
@@ -282,23 +336,26 @@ class PrimalDualTrainer():
                         self.primal_optim.zero_grad()
                         y = self.primal_net(Xtrain, train_eq_rhs, train_ineq_rhs)
                         with torch.no_grad():
-                            mu, lamb = frozen_dual_net(Xtrain, train_eq_cm)
+                            if k == 0:
+                                mu, lamb = torch.zeros_like(train_ineq_rhs), torch.zeros_like(train_eq_rhs)
+                            else:
+                                mu, lamb = frozen_dual_net(Xtrain, train_eq_cm)
                         batch_loss = self.primal_loss(y, train_eq_cm, train_ineq_cm, train_eq_rhs, train_ineq_rhs, mu, lamb).mean()
                         total_train_loss += batch_loss.item()
                         batch_loss.backward()
+
                         self.primal_optim.step()
                         num_batches += 1
                     
                     # Compute average loss for the epoch
+                    #! Scheduler on training set (should be validation set)
                     avg_train_loss = total_train_loss / num_batches
                     self.primal_scheduler.step(avg_train_loss)
-
-                    # Step optimizer with gradients accumulated over the epoch
 
                     # Logg training loss:
                     with torch.no_grad():
                         self.logger.log_loss(batch_loss, "primal", self.step)
-                        self.logger.log_train(self.data, primal_net=self.primal_net, dual_net=frozen_dual_net, step=self.step)
+                        self.logger.log_train(self.data, primal_net=self.primal_net, dual_net=frozen_dual_net, rho=self.rho, step=self.step)
 
                     # Evaluate validation loss every epoch, and update learning rate
                     # with torch.no_grad():
@@ -340,20 +397,21 @@ class PrimalDualTrainer():
                             mu_k, lamb_k = frozen_dual_net(Xtrain, train_eq_cm)
                             y = frozen_primal_net(Xtrain, train_eq_rhs, train_ineq_rhs)
                         # ! Test other loss!
-                        batch_loss = self.dual_loss(y, train_eq_cm, train_ineq_cm, train_eq_rhs, train_ineq_rhs, mu, lamb, mu_k, lamb_k).mean()
-                        # batch_loss = self.dual_loss_changed(y, train_eq_cm, train_ineq_cm, train_eq_rhs, train_ineq_rhs, mu, lamb, mu_k, lamb_k).mean()
+                        # batch_loss = self.dual_loss(y, train_eq_cm, train_ineq_cm, train_eq_rhs, train_ineq_rhs, mu, lamb, mu_k, lamb_k).mean()
+                        batch_loss = self.dual_loss_changed(y, train_eq_cm, train_ineq_cm, train_eq_rhs, train_ineq_rhs, mu, lamb, mu_k, lamb_k).mean()
                         batch_loss.backward()
                         self.dual_optim.step()
                         total_train_loss += batch_loss.item()
                         num_batches += 1
                     
+                    #! Scheduler on training set (should be validation set)
                     avg_train_loss = total_train_loss / num_batches
                     self.dual_scheduler.step(avg_train_loss)
                     
                     with torch.no_grad():
                         # Logg training loss:
                         self.logger.log_loss(batch_loss, "dual", self.step)
-                        self.logger.log_train(self.data, primal_net=frozen_primal_net, dual_net=self.dual_net, step=self.step)
+                        self.logger.log_train(self.data, primal_net=frozen_primal_net, dual_net=self.dual_net, rho=self.rho, step=self.step)
 
                     # Evaluate validation loss every epoch, and update learning rate
                     # TODO! Does scheduler correctly decrease LR when rho is increased, if the training set is small?
@@ -370,6 +428,8 @@ class PrimalDualTrainer():
                     #     curr_val_loss /= len(self.valid_loader)
                     #     # Normalize by rho, so that the schedular still works correctly if rho is increased
                     #     self.dual_scheduler.step(torch.sign(curr_val_loss) * (torch.abs(curr_val_loss) / self.rho))
+
+                self.logger.log_val(self.data, self.primal_net, self.dual_net, self.step)
 
                 end_time = time.time()
                 stats = epoch_stats
@@ -392,15 +452,13 @@ class PrimalDualTrainer():
 
         with open(os.path.join(self.save_dir, 'stats.dict'), 'wb') as f:
             pickle.dump(stats, f)
-        with open(os.path.join(self.save_dir, 'primal_net.dict'), 'wb') as f:
-            torch.save(self.primal_net.state_dict(), f)
-        with open(os.path.join(self.save_dir, 'dual_net.dict'), 'wb') as f:
-            torch.save(self.dual_net.state_dict(), f)
+        
+        self.save(self.save_dir)
 
         return self.primal_net, self.dual_net, stats
 
     def primal_loss(self, y, eq_cm, ineq_cm, eq_rhs, ineq_rhs, mu, lamb):
-        obj = self.data.obj_fn(y)
+        obj = self.data.obj_fn_train(y)
         
         # g(y)
         ineq = self.data.ineq_resid(y, ineq_cm, ineq_rhs)
@@ -411,9 +469,11 @@ class PrimalDualTrainer():
         # Element-wise clamping of mu_i when g_i (ineq) is negative
         # mu = torch.where(ineq < 0, torch.zeros_like(mu), mu)
         # ! Clamp ineq_resid?
-        # ineq = ineq.clamp(min=0)
+        ineq = ineq.clamp(min=0)
 
         lagrange_ineq = torch.sum(mu * ineq, dim=1)  # Shape (batch_size,)
+        # ! Clamp the lagrangian inequality term --> we do not adhere to KKT (why not?)
+        # lagrange_ineq = torch.sum(mu * ineq, dim=1).clamp(min=0)  # Shape (batch_size,)
 
         lagrange_eq = torch.sum(lamb * eq, dim=1)   # Shape (batch_size,)
 
@@ -421,7 +481,12 @@ class PrimalDualTrainer():
         violation_eq = torch.sum(eq ** 2, dim=1)
         penalty = self.rho/2 * (violation_ineq + violation_eq)
 
+        # ! Primal loss might need to be scaled to work.
+        # loss = (obj*1e3 + (lagrange_ineq + lagrange_eq + penalty))
         loss = (obj + (lagrange_ineq + lagrange_eq + penalty))
+
+        #! Test only optimizing objective.
+        # loss = obj
 
         return loss
 
@@ -456,21 +521,9 @@ class PrimalDualTrainer():
         #! We maximize the dual obj func, so to use it in the loss, take the negation.
         dual_obj = -self.data.dual_obj_fn(eq_rhs, ineq_rhs, mu, lamb)
 
-        #! Enforced with ReLU.
-        # ineq = self.data.dual_ineq_resid(mu, lamb)
 
-        eq = self.data.dual_eq_resid(mu, lamb, eq_cm, ineq_cm)
-        # Lagrange multiplier becomes y
-        lagrange_eq = torch.sum(y * eq, dim=1)
-
-        violation_eq = torch.sum(eq ** 2, dim=1)
-
-        penalty = self.rho/2 * violation_eq
-
-        loss = dual_obj + lagrange_eq + penalty
-        # loss = dual_obj + penalty
-
-        return loss
+        #! Dual constraints are never violated, so we do not include penalty and lagrangian terms.
+        return dual_obj
 
     def violation(self, y, eq_cm, ineq_cm, eq_rhs, ineq_rhs, mu_k):
         # Calculate the equality constraint function h_x(y)
@@ -493,78 +546,11 @@ class PrimalDualTrainer():
         
         return v_k.max().item()
 
-    # Modifies stats in place
-    def dict_agg(self, stats, key, value, op='concat'):
-        if key in stats.keys():
-            if op == 'sum':
-                stats[key] += value
-            elif op == 'concat':
-                stats[key] = np.concatenate((stats[key], value), axis=0)
-            else:
-                raise NotImplementedError
-        else:
-            stats[key] = value
+    def save(self, save_dir):
+        print("saving")
+        torch.save(self.primal_net.state_dict(), save_dir + '/primal_weights.pth')
+        torch.save(self.dual_net.state_dict(), save_dir + '/dual_weights.pth')
 
-    # Modifies stats in place
-    def eval_pdl(self, X, eq_cm, ineq_cm, eq_rhs, ineq_rhs, primal_net, dual_net, prefix, stats, targets=None):
-
-        eps_converge = self.args['corrEps']
-        make_prefix = lambda x: "{}_{}".format(prefix, x)
-        start_time = time.time()
-        # Y = primal_net(X_scaled)
-        # mu, lamb = dual_net(X_scaled)
-        Y = primal_net(X)
-        mu, lamb = dual_net(X)
-        raw_end_time = time.time()
-        Ycorr = Y
-
-        # Ycorr, steps = grad_steps_all(data, X, Y, args)
-
-        self.dict_agg(stats, make_prefix('time'), time.time() - start_time, op='sum')
-        # self.dict_agg(stats, make_prefix('steps'), np.array([steps]))
-        self.dict_agg(stats, make_prefix('primal_loss'), self.primal_loss(Y, eq_cm, ineq_cm, eq_rhs, ineq_rhs, mu, lamb).detach().cpu().numpy())
-        # self.dict_agg(stats, make_prefix('dual_loss'), self.dual_loss(X, Y, mu, lamb, mu_k, lamb_k, log_type=None).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('eval'), self.data.obj_fn(Ycorr).detach().cpu().numpy())
-
-        self.dict_agg(stats, make_prefix('ineq_max'), torch.max(self.data.ineq_dist(Y, ineq_cm, ineq_rhs), dim=1)[0].detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('ineq_mean'), torch.mean(self.data.ineq_dist(Y, ineq_cm, ineq_rhs,), dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('ineq_num_viol_0'),
-                torch.sum(self.data.ineq_dist(Y, ineq_cm, ineq_rhs) > eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('ineq_num_viol_1'),
-                torch.sum(self.data.ineq_dist(Y, ineq_cm, ineq_rhs) > 10 * eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('ineq_num_viol_2'),
-                torch.sum(self.data.ineq_dist(Y, ineq_cm, ineq_rhs) > 100 * eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('eq_max'),
-                torch.max(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)), dim=1)[0].detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('eq_mean'), torch.mean(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)), dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('eq_num_viol_0'),
-                torch.sum(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)) > eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('eq_num_viol_1'),
-                torch.sum(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)) > 10 * eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('eq_num_viol_2'),
-                torch.sum(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)) > 100 * eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_time'), raw_end_time - start_time, op='sum')
-        self.dict_agg(stats, make_prefix('raw_eval'), self.data.obj_fn(Y).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_ineq_max'), torch.max(self.data.ineq_dist(Y, ineq_cm, ineq_rhs), dim=1)[0].detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_ineq_mean'), torch.mean(self.data.ineq_dist(Y, ineq_cm, ineq_rhs), dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_ineq_num_viol_0'),
-                torch.sum(self.data.ineq_dist(Y, ineq_cm, ineq_rhs) > eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_ineq_num_viol_1'),
-                torch.sum(self.data.ineq_dist(Y, ineq_cm, ineq_rhs) > 10 * eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_ineq_num_viol_2'),
-                torch.sum(self.data.ineq_dist(Y, ineq_cm, ineq_rhs) > 100 * eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_eq_max'),
-                torch.max(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)), dim=1)[0].detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_eq_mean'),
-                torch.mean(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)), dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_eq_num_viol_0'),
-                torch.sum(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)) > eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_eq_num_viol_1'),
-                torch.sum(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)) > 10 * eps_converge, dim=1).detach().cpu().numpy())
-        self.dict_agg(stats, make_prefix('raw_eq_num_viol_2'),
-                torch.sum(torch.abs(self.data.eq_resid(Y, eq_cm, eq_rhs)) > 100 * eps_converge, dim=1).detach().cpu().numpy())
-
-        return stats
 
 class PrimalNet(nn.Module):
     def __init__(self, data, hidden_sizes):
@@ -592,87 +578,6 @@ class PrimalNet(nn.Module):
     def forward(self, x, eq_rhs, ineq_rhs):
         return self.net(x)
 
-class PrimalGCNNet(nn.Module):
-    def __init__(self, data, hidden_sizes):
-        super().__init__()
-        self._data = data
-        self._hidden_sizes = hidden_sizes
-        
-        self.gcn = torch_geometric.nn.conv.GCNConv(1, 1)
-        self.gcn.reset_parameters()
-        # Create the list of layer sizes
-        layer_sizes = [data.xdim] + self._hidden_sizes + [data.ydim]
-        layers = []
-
-        # Create layers dynamically based on the provided hidden_sizes
-        for in_size, out_size in zip(layer_sizes[:-1], layer_sizes[1:]):
-            layers.append(nn.Linear(in_size, out_size))
-            if out_size != data.ydim:  # Add ReLU activation for hidden layers only
-                layers.append(nn.ReLU())
-
-        # Initialize all layers
-        for layer in layers:
-            if isinstance(layer, nn.Linear):
-                nn.init.kaiming_normal_(layer.weight)
-
-        self.net = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        # ! Only works for batches of 1!
-        edge_index = self._data.edge_index_demand
-        x_pDemand = x[:, :self._data.neq]
-        x_pGenAva = x[:, self._data.neq:]
-        # Reshape x_pDemand for GCN: [batch_size * num_nodes, 1]
-        batch_size, num_nodes = x_pDemand.shape
-        x_pDemand = x_pDemand.T.reshape(-1, 1)  # Shape: [batch_size * num_nodes, 1]
-
-         # Apply GCN layer
-        x_pDemand = self.gcn(x_pDemand, edge_index.repeat(1, batch_size))  # Use repeated edge_index
-        x_pDemand = torch.relu(x_pDemand)
-
-        # Reshape back to batch dimension: [batch_size, num_nodes]
-        x_pDemand = x_pDemand.view(num_nodes, batch_size).T
-
-        x = torch.concat([x_pDemand, x_pGenAva], dim=1)
-
-        return self.net(x)
-    
-class PrimalCNNNet(nn.Module):
-    def __init__(self, data, hidden_channels, kernel_size=3):
-        super().__init__()
-        self._data = data
-        self._hidden_channels = hidden_channels
-        
-        # Define input and output sizes
-        input_features = data.xdim
-        output_features = data.ydim
-
-        # Create convolutional layers
-        layers = []
-        channels = [1] + hidden_channels  # Start with single input channel
-
-        for in_channels, out_channels in zip(channels[:-1], channels[1:]):
-            layers.append(nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=kernel_size // 2))
-            layers.append(nn.ReLU())
-
-        # Final layer to map to output dimensions
-        layers.append(nn.Conv1d(hidden_channels[-1], 1, kernel_size=kernel_size, padding=kernel_size // 2))
-
-        self.conv_net = nn.Sequential(*layers)
-        self.fc = nn.Linear(input_features, output_features)
-
-    def forward(self, x):
-        # Reshape input to [batch_size, 1, num_features] for Conv1d
-        x = x.unsqueeze(1)
-
-        # Pass through convolutional layers
-        x = self.conv_net(x)
-
-        # Flatten back to [batch_size, num_features]
-        x = x.squeeze(1)
-
-        # Map to final output using a fully connected layer
-        return self.fc(x)
 
 class DualNetEndToEnd(nn.Module):
     def __init__(self, data, n_size_factor=1.5, n_layers=4):
@@ -680,24 +585,40 @@ class DualNetEndToEnd(nn.Module):
         self._data = data
         self._hidden_sizes = [int(n_size_factor*data.xdim)] * n_layers
 
-        self._out_dim = data.n_prod_vars + data.n_line_vars
+        if data.args["benders_compact"]:
+            self._out_dim = data.num_g + data.neq
+        else:
+            self._out_dim = data.neq
 
         #! Only predict lambda, we infer mu from it.
-        self.feed_forward = FeedForwardNet(data.xdim, self._hidden_sizes, output_dim=data.neq)
-        
-        
-    def forward(self, x, eq_cm):
-        out_lamb = self.feed_forward(x)
+        self.feed_forward = FeedForwardNet(data.xdim, self._hidden_sizes, output_dim=self._out_dim)
 
-        # out_mu = torch.relu(x_out[:, :self._data.nineq])
-        # out_lamb = x_out[:, self._data.nineq:]
-        mu = self._data.obj_coeff + torch.bmm(eq_cm.transpose(1, 2), out_lamb.unsqueeze(-1)).squeeze(-1)
+        # Set dual variables to 0 at the first iteration
+        nn.init.zeros_(self.feed_forward.net[-1].weight)  # Initialize output layer weights to 0
+        nn.init.zeros_(self.feed_forward.net[-1].bias)    # Initialize output layer biases to 0
+    
+    def complete_duals(self, lamb, eq_cm):
+         # first num_g outputs are the equality constraints added in benders compact form
+        if self._data.args["benders_compact"]:
+            # lamb_ui_g = out_lamb[:, :self._data.num_g]
+            lamb_D_nt = lamb[:, self._data.num_g:]
+            eq_cm_D_nt = eq_cm[:, self._data.num_g:, self._data.num_g:]
+            obj_coeff = self._data.obj_coeff[self._data.num_g:]
+        else:
+            eq_cm_D_nt = eq_cm
+            lamb_D_nt = lamb
+            obj_coeff = self._data.obj_coeff
+
+        mu = obj_coeff - torch.bmm(eq_cm_D_nt.transpose(1, 2), lamb_D_nt.unsqueeze(-1)).squeeze(-1)
 
         mu = mu.view(mu.shape[0], self._data.sample_duration, -1)  # Shape: (batch_size, t, constraints)
 
         # Compute lower and upper bound multipliers
         mu_lb = torch.relu(mu)   # Lower bound multipliers |mu|^+
         mu_ub = torch.relu(-mu)  # Upper bound multipliers |mu|^-
+
+        # mu_lb = mu * (mu > 0).float().detach()
+        # mu_ub = -mu * (mu < 0).float().detach()
 
         # Split into groups, following the exact structure of mu
         p_g_lb = mu_lb[:, :, :self._data.num_g]  # Lower bounds for p_g
@@ -716,11 +637,14 @@ class DualNetEndToEnd(nn.Module):
             md_n_lb, md_n_ub  # Lower and Upper bounds for md_n
         ], dim=-1).reshape(mu.shape[0], -1)  # Flatten back to (batch_size, constraints * t)
 
-        return out_mu, out_lamb
+        return out_mu
+        
+        
+    def forward(self, x, eq_cm):
+        out_lamb = self.feed_forward(x)
+        out_mu = self.complete_duals(out_lamb, eq_cm)
 
-class DualCompleteLayer(nn.Module):
-    def __init__():
-        super().__init__()
+        return out_mu, out_lamb
 
 class DualNet(nn.Module):
     def __init__(self, data, hidden_sizes, mu_size, lamb_size):
@@ -792,64 +716,6 @@ class DualNetTwoOutputLayers(nn.Module):
         return out_mu, out_lamb
 
 
-class DualGCNNet(nn.Module):
-    def __init__(self, data, hidden_sizes, mu_size, lamb_size):
-        super().__init__()
-        self._data = data
-        self._hidden_sizes = hidden_sizes
-        self._mu_size = mu_size
-        self._lamb_size = lamb_size
-
-        self.gcn = torch_geometric.nn.conv.GCNConv(1, 1)
-        self.gcn.reset_parameters()
-        # Create the list of layer sizes
-        layer_sizes = [data.xdim] + self._hidden_sizes
-        layers = []
-
-        # Create layers dynamically based on the provided hidden_sizes
-        for in_size, out_size in zip(layer_sizes[:-1], layer_sizes[1:]):
-            layers.append(nn.Linear(in_size, out_size))
-            if out_size != data.ydim:  # Add ReLU activation for hidden layers only
-                layers.append(nn.ReLU())
-
-        # Initialize all layers
-        for layer in layers:
-            if isinstance(layer, nn.Linear):
-                nn.init.kaiming_normal_(layer.weight)
-        
-         # Add the output layer
-        self.out_layer = nn.Linear(self._hidden_sizes[-1], self._mu_size + self._lamb_size)
-        nn.init.zeros_(self.out_layer.weight)  # Initialize output layer weights to 0
-        nn.init.zeros_(self.out_layer.bias)    # Initialize output layer biases to 0
-        layers.append(self.out_layer)
-
-        self.net = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        # ! Only works for batches of 1!
-        edge_index = self._data.edge_index_demand
-        x_pDemand = x[:, :self._data.neq]
-        x_pGenAva = x[:, self._data.neq:]
-        # Reshape x_pDemand for GCN: [batch_size * num_nodes, 1]
-        batch_size, num_nodes = x_pDemand.shape
-        x_pDemand = x_pDemand.T.reshape(-1, 1)  # Shape: [batch_size * num_nodes, 1]
-
-         # Apply GCN layer
-        x_pDemand = self.gcn(x_pDemand, edge_index.repeat(1, batch_size))  # Use repeated edge_index
-        x_pDemand = torch.relu(x_pDemand)
-
-        # Reshape back to batch dimension: [batch_size, num_nodes]
-        x_pDemand = x_pDemand.view(num_nodes, batch_size).T
-
-        x = torch.concat([x_pDemand, x_pGenAva], dim=1)
-        x = torch.concat([x_pDemand, x_pGenAva], dim=1)
-
-        out = self.net(x)
-        out_mu = out[:, :self._mu_size]
-        out_lamb = out[:, self._mu_size:]
-
-        return out_mu, out_lamb
-
 class FeedForwardNet(nn.Module):
     def __init__(self, input_dim, hidden_sizes, output_dim):
         """_summary_
@@ -875,6 +741,7 @@ class FeedForwardNet(nn.Module):
             # Add ReLU only if it is not the last layer
             if idx < len(layer_sizes) - 2:  # The last layer does not need ReLU
                 layers.append(nn.ReLU())
+                # layers.append(nn.LeakyReLU())
         
         # Initialize all layers
         for layer in layers:
@@ -891,7 +758,7 @@ class BoundRepairLayer(nn.Module):
     def __init__(self):
         super().__init__()
     
-    def forward(self, x, lb, ub):
+    def forward(self, x, lb, ub, k=5):
         """_summary_
 
         Args:
@@ -903,7 +770,7 @@ class BoundRepairLayer(nn.Module):
             _type_: _description_
         """
 
-        return lb + (ub - lb) * torch.sigmoid(x)
+        return lb + (ub - lb) * torch.sigmoid(k*x)
         # return torch.clamp(x, lb, ub)
         # return (lb + (ub - lb)/2 * (torch.tanh(x) + 1))
 
@@ -941,9 +808,12 @@ class PrimalNetEndToEnd(nn.Module):
             self._data = data
             self._hidden_sizes = [int(n_size_factor*data.xdim)] * n_layers
 
-            self._out_dim = data.n_prod_vars + data.n_line_vars
+            if self._data.args["benders_compact"]:
+                self._out_dim = data.num_g + data.n_prod_vars + data.n_line_vars
+            else:
+                self._out_dim = data.n_prod_vars + data.n_line_vars
 
-            self.feed_forward = FeedForwardNet(data.xdim, self._hidden_sizes, output_dim=data.n_prod_vars+data.n_line_vars)
+            self.feed_forward = FeedForwardNet(data.xdim, self._hidden_sizes, output_dim=self._out_dim)
             self.bound_repair_layer = BoundRepairLayer()
             # self.ramping_repair_layer = RampingRepairLayer()
 
@@ -953,7 +823,7 @@ class PrimalNetEndToEnd(nn.Module):
             x_out = self.feed_forward(x)
 
             # [B, G, T], [B, L, T]
-            p_gt, f_lt = self._data.split_dec_vars_from_Y_raw(x_out)
+            ui_g, p_gt, f_lt = self._data.split_dec_vars_from_Y_raw(x_out)
             
             # [B, bounds, T]
             p_gt_lb, p_gt_ub, f_lt_lb, f_lt_ub, md_nt_lb, md_nt_ub = self._data.split_ineq_constraints(ineq_rhs)
@@ -963,11 +833,21 @@ class PrimalNetEndToEnd(nn.Module):
             # Lineflow lower bound is negative.
             f_lt_bound_repaired = self.bound_repair_layer(f_lt, -f_lt_lb, f_lt_ub)
 
-            D_nt = self._data.split_eq_constraints(eq_rhs)
+            UI_g, D_nt = self._data.split_eq_constraints(eq_rhs)
             md_nt = self.estimate_slack_layer(p_gt_bound_repaired, f_lt_bound_repaired, D_nt)
 
             y = torch.cat([p_gt_bound_repaired, f_lt_bound_repaired, md_nt], dim=1).permute(0, 2, 1).reshape(x_out.shape[0], -1)
 
+            if self._data.args["benders_compact"]:
+                y = torch.cat([ui_g, y], dim=1)
+
             return y
          
          
+def load(data, save_dir):
+    primal_net = PrimalNetEndToEnd(data=data)
+    primal_net.load_state_dict(torch.load(save_dir + '/primal_weights.pth', weights_only=True))
+    dual_net = DualNetEndToEnd(data=data)
+    dual_net.load_state_dict(torch.load(save_dir + '/dual_weights.pth', weights_only=True))
+
+    return primal_net, dual_net

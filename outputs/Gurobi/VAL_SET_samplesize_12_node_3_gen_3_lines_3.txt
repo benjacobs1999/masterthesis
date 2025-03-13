@@ -1,5 +1,0 @@
-N: ['BEL', 'GER', 'NED']
-G: [('BEL', 'SunPV'), ('GER', 'SunPV'), ('NED', 'SunPV')]
-L: [('BEL', 'GER'), ('BEL', 'NED'), ('GER', 'NED')]
-Obj value mean: 1132056901.8343623
-Time taken mean: 0.007448620992164089

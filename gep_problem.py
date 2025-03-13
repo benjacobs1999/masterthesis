@@ -53,15 +53,16 @@ class GEPProblemSet():
         # Time slices, each slice makes a different sample.
         self.time_ranges = [range(i, i + self.sample_duration, 1) for i in range(1, len(T), self.sample_duration)]
 
-        self.neq = self.n_eq_per_t * self.sample_duration 
-        self.nineq = self.n_ineq_per_t * self.sample_duration #Q Maaike: with investment var right?
         self.n_inv_vars = self.num_g
         self.n_prod_vars = self.num_g * self.sample_duration
         self.n_line_vars = self.num_l * self.sample_duration
         self.n_md_vars = self.num_n * self.sample_duration
-        self.ydim = self.n_inv_vars + self.n_prod_vars + self.n_line_vars + self.n_md_vars #Q Maaike: why is this  a tuple?
 
-        # self._opt_targets = self.load_targets(target_path)
+        self.neq = self.n_eq_per_t * self.sample_duration 
+        self.nineq = self.n_ineq_per_t * self.sample_duration + self.n_inv_vars #Q Maaike: with investment var right?
+        self.ydim = self.n_inv_vars + self.n_prod_vars + self.n_line_vars + self.n_md_vars
+
+        self._opt_targets = self.load_targets(target_path)
 
         # Masks for node balance!
         # Initialize mask

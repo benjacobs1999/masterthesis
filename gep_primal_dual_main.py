@@ -4,13 +4,10 @@ import time
 from gep_config_parser import *
 from data_wrangling import dataframe_to_dict
 
-# from primal_dual import PrimalDualTrainer
+from primal_dual import PrimalDualTrainer, load
 from gep_problem import GEPProblemSet
 from gep_problem_operational import GEPOperationalProblemSet
 from get_gurobi_vars import save_opt_targets
-from gep_benders import solve_matrix_problem
-from gep_benders import solve_matrix_problem_simple
-from gep_benders import solve_with_benders
 
 CONFIG_FILE_NAME        = "config.toml"
 VISUALIZATION_FILE_NAME = "visualization.toml"
@@ -33,7 +30,7 @@ def scale_dict(data_dict, scale_factor):
     return {key: value * scale_factor for key, value in data_dict.items()}
 
 
-def prep_data(args, inputs, target_path):
+def prep_data(args, inputs, target_path, operational=False):
     print("Wrangling the input data")
 
     # Extract sets
@@ -128,26 +125,18 @@ def prep_data(args, inputs, target_path):
     pExpCap = dict(sorted(pExpCap.items()))
     pImpCap = dict(sorted(pImpCap.items()))
 
-    time_ranges = [range(i, i + args["sample_duration"], 1) for i in range(1, len(T), args["sample_duration"])]
-    
-    # if not os.path.exists(target_path):
-    #     save_opt_targets(args, experiment_instance, target_path, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, time_ranges)
+    if not os.path.exists(target_path):
+        time_ranges = [range(i, i + args["sample_duration"], 1) for i in range(1, len(T), args["sample_duration"])]
+        save_opt_targets(args, inputs, target_path, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, time_ranges)
 
 
     print("Creating problem instance")
-    if args["operational"]:
+    if operational:
         data = GEPOperationalProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, target_path=target_path)
     else:
         data = GEPProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, target_path=target_path)
 
     return data
-
-def run_PDL(data, args, save_dir):
-    # Run PDL
-    print("Training the PDL")
-    trainer = PrimalDualTrainer(data, args, save_dir, log=False)
-    primal_net, dual_net, stats = trainer.train_PDL()
-    return primal_net, dual_net
 
 if __name__ == "__main__":
     import json
@@ -179,24 +168,21 @@ if __name__ == "__main__":
             with open(os.path.join(save_dir, 'args.dict'), 'wb') as f:
                 pickle.dump(args, f)
 
-            target_path = f"outputs/Gurobi/Operational={args['operational']}_T={args['sample_duration']}_{args['G']}"
+            target_path = f"outputs/Gurobi/Operational={args['operational']}_T={args['sample_duration']}_Scale={args['scale_problem']}_{args['G']}_{args['L']}"
 
             # Prep problem data:
-            data = prep_data(args=args, inputs=experiment_instance, target_path=target_path)
+            data = prep_data(args=args, inputs=experiment_instance, target_path=target_path, operational=args['operational'])
 
-            # # Run PDL
-            # primal_net, dual_net = run_PDL(data, args, save_dir)
+            # Run PDL
+            trainer = PrimalDualTrainer(data, args, save_dir)
+            primal_net, dual_net, stats = trainer.train_PDL()
 
-            # data.plot_balance(primal_net, dual_net)
-            # data.plot_decision_variable_diffs(primal_net, dual_net)
-
-            # Solve single sample with matrix formulation
-            sample = 1 # only solve first sample for now 
-            # solution = solve_matrix_problem(data, sample) # solution = Obj: 2374.99
-            # solution sample 1 = 2790.09
+            # primal_net, dual_net = load(data, save_dir)
 
             # Solve single sample with Benders decomposition
             # sample = 0 # solution = Obj: 2374.99
             compact = False
             solve_with_benders(data, compact, sample)
+            data.plot_balance(primal_net, dual_net)
+            data.plot_decision_variable_diffs(primal_net, dual_net)
 
