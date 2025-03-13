@@ -12,7 +12,7 @@ import numpy as np
 DTYPE = torch.float64
 DEVICE = torch.device="cpu"
 torch.autograd.set_detect_anomaly(True)
-torch.manual_seed(42)
+# torch.manual_seed(42)
 print(f"Running on {DEVICE}")
 
 class CustomDataset(torch.utils.data.Dataset):
@@ -81,7 +81,7 @@ class TensorBoardLogger():
 
             # Loss components
             # lagrange_ineq = torch.sum(mu * ineq_resid, dim=1)  # Shape (batch_size,)
-            lagrange_ineq = torch.sum(mu * ineq_resid, dim=1).clamp(min=0)  # Shape (batch_size,)
+            lagrange_ineq = torch.sum(mu * ineq_resid, dim=1)  # Shape (batch_size,)
             lagrange_eq = torch.sum(lamb * eq_resid, dim=1)   # Shape (batch_size,)
             violation_ineq = torch.sum(torch.maximum(ineq_resid, torch.zeros_like(ineq_resid)) ** 2, dim=1)
             violation_eq = torch.sum(eq_resid ** 2, dim=1)
@@ -202,9 +202,37 @@ class TensorBoardLogger():
         self.writer.add_scalar(f"Rho_and_violation/rho", rho, step)
         self.writer.add_scalar(f"Rho_and_violation/v_k", v_k, step)
 
-    def log_val(self, data, primal_net, dual_net):
-        pass
-    
+    def log_val(self, data, primal_net, dual_net, step):
+        with torch.no_grad():
+            Y = primal_net(data.X[data.valid_indices], data.eq_rhs[data.valid_indices], data.ineq_rhs[data.valid_indices])
+            mu, lamb = dual_net(data.X[data.valid_indices], data.eq_cm[data.valid_indices])
+            obj = data.obj_fn(Y) # Containes penalization of negative missed demand
+            obj_train = data.obj_fn_train(Y) # Does not penalize negative missed demand
+            dual_obj = data.dual_obj_fn(data.eq_rhs[data.valid_indices], data.ineq_rhs[data.valid_indices], mu, lamb)
+
+            Y_target = data.opt_targets["y_operational"][data.valid_indices]
+            mu_target = data.opt_targets["mu_operational"][data.valid_indices]
+            lamb_target = data.opt_targets["lamb_operational"][data.valid_indices]
+
+            # print(Y[0, 5*14:5*15].tolist())
+
+            ineq_resid = data.ineq_resid(Y, data.ineq_cm[data.valid_indices], data.ineq_rhs[data.valid_indices])
+            ineq_dist = data.ineq_dist(Y, data.ineq_cm[data.valid_indices], data.ineq_rhs[data.valid_indices])
+
+            eq_resid = data.eq_resid(Y, data.eq_cm[data.valid_indices], data.eq_rhs[data.valid_indices])
+
+            obj_target = data.obj_fn_log(Y_target)
+            dual_obj_target = data.dual_obj_fn(data.eq_rhs[data.valid_indices], data.ineq_rhs[data.valid_indices], mu_target, lamb_target)
+            # Obj funcs
+            self.writer.add_scalar(f"Validation/obj", obj.mean(), step)
+            self.writer.add_scalar(f"Validation/dual_obj", dual_obj.mean(), step)
+            self.writer.add_scalar(f"Validation/obj_optimality_gap", ((obj - obj_target)/obj_target).mean(), step)
+            self.writer.add_scalar(f"Validation/dual_obj_optimality_gap", (-(dual_obj - dual_obj_target)/dual_obj_target).mean(), step)
+            # Constraint violations
+            self.writer.add_scalar(f"Validation/ineq_mean", ineq_dist.mean(), step)
+            self.writer.add_scalar(f"Validation/ineq_max", ineq_dist.max(), step)
+            self.writer.add_scalar(f"Validation/eq_mean", eq_resid.abs().mean(), step)
+            self.writer.add_scalar(f"Validation/eq_max", eq_resid.abs().max(), step)
         
 class PrimalDualTrainer():
 
@@ -308,10 +336,14 @@ class PrimalDualTrainer():
                         self.primal_optim.zero_grad()
                         y = self.primal_net(Xtrain, train_eq_rhs, train_ineq_rhs)
                         with torch.no_grad():
-                            mu, lamb = frozen_dual_net(Xtrain, train_eq_cm)
+                            if k == 0:
+                                mu, lamb = torch.zeros_like(train_ineq_rhs), torch.zeros_like(train_eq_rhs)
+                            else:
+                                mu, lamb = frozen_dual_net(Xtrain, train_eq_cm)
                         batch_loss = self.primal_loss(y, train_eq_cm, train_ineq_cm, train_eq_rhs, train_ineq_rhs, mu, lamb).mean()
                         total_train_loss += batch_loss.item()
                         batch_loss.backward()
+
                         self.primal_optim.step()
                         num_batches += 1
                     
@@ -397,6 +429,8 @@ class PrimalDualTrainer():
                     #     # Normalize by rho, so that the schedular still works correctly if rho is increased
                     #     self.dual_scheduler.step(torch.sign(curr_val_loss) * (torch.abs(curr_val_loss) / self.rho))
 
+                self.logger.log_val(self.data, self.primal_net, self.dual_net, self.step)
+
                 end_time = time.time()
                 stats = epoch_stats
                 print(f"Epoch {k} done. Time taken: {end_time - begin_time}. Rho: {self.rho}. Primal LR: {self.primal_optim.param_groups[0]['lr']}, Dual LR: {self.dual_optim.param_groups[0]['lr']}")
@@ -435,11 +469,11 @@ class PrimalDualTrainer():
         # Element-wise clamping of mu_i when g_i (ineq) is negative
         # mu = torch.where(ineq < 0, torch.zeros_like(mu), mu)
         # ! Clamp ineq_resid?
-        # ineq = ineq.clamp(min=0)
+        ineq = ineq.clamp(min=0)
 
-        # lagrange_ineq = torch.sum(mu * ineq, dim=1)  # Shape (batch_size,)
+        lagrange_ineq = torch.sum(mu * ineq, dim=1)  # Shape (batch_size,)
         # ! Clamp the lagrangian inequality term --> we do not adhere to KKT (why not?)
-        lagrange_ineq = torch.sum(mu * ineq, dim=1).clamp(min=0)  # Shape (batch_size,)
+        # lagrange_ineq = torch.sum(mu * ineq, dim=1).clamp(min=0)  # Shape (batch_size,)
 
         lagrange_eq = torch.sum(lamb * eq, dim=1)   # Shape (batch_size,)
 
@@ -707,6 +741,7 @@ class FeedForwardNet(nn.Module):
             # Add ReLU only if it is not the last layer
             if idx < len(layer_sizes) - 2:  # The last layer does not need ReLU
                 layers.append(nn.ReLU())
+                # layers.append(nn.LeakyReLU())
         
         # Initialize all layers
         for layer in layers:
@@ -768,7 +803,7 @@ class EstimateSlackLayer(nn.Module):
 
 class PrimalNetEndToEnd(nn.Module):
         # TODO! Validate the repair layers in a jupyter notebook!
-        def __init__(self, data, n_size_factor=10, n_layers=4):
+        def __init__(self, data, n_size_factor=1.5, n_layers=4):
             super().__init__()
             self._data = data
             self._hidden_sizes = [int(n_size_factor*data.xdim)] * n_layers

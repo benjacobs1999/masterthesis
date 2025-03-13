@@ -49,6 +49,10 @@ class GEPOperationalProblemSet():
         self.pUnitCap = pUnitCap
         self.pExpCap = pExpCap
         self.pImpCap = pImpCap
+
+        # Value can be None (we don't perturb) or a 
+        if self.args['perturb_operating_costs']:
+            self.pVarCost = self.perturb_operating_costs(self.args['perturb_operating_costs'])
         
         # Number of variables per timestep -- per timestep, variables are [p_g, f_l, md_n]
         self.n_var_per_t = self.num_g + self.num_l + self.num_n
@@ -123,7 +127,33 @@ class GEPOperationalProblemSet():
     def load_targets(self, target_path):
         with open(target_path, 'rb') as file:
             return pickle.load(file)
+        
+    def perturb_operating_costs(self, noise=0.01):
+        """Perturbs the operating costs to remove symmetry in the solution space -- This stagnates the learning of the neural network.
 
+        Args:
+            noise (_type_, optional): _description_. Defaults to 1e-6.
+
+        Returns:
+            _type_: _description_
+        """
+        # Group keys by their cost value
+        groups = {}
+        for key, cost in self.pVarCost.items():
+            groups.setdefault(cost, []).append(key)
+
+        perturbed_pVarCost = {}
+        for cost, keys in groups.items():
+            if len(keys) > 1:
+                n = len(keys)
+                # Generate evenly spaced noise values between -noise and noise.
+                noise_values = [ -noise + (2 * noise * i) / (n - 1) for i in range(n) ]
+                for key, noise_val in zip(keys, noise_values):
+                    perturbed_pVarCost[key] = cost + noise_val*cost
+            else:
+                perturbed_pVarCost[keys[0]] = cost
+
+        return perturbed_pVarCost
 
     def get_md_nt_indices(self):
         indices = []
@@ -277,9 +307,10 @@ class GEPOperationalProblemSet():
         # Objective function adjusted for training (different than the actual objective function)
         # Y = Y.clone()
         # Y[:, self.md_indices] = Y[:, self.md_indices].abs()
-        reg_term_md = torch.norm(Y[:, self.md_indices], p=1, dim=1) #l1 regularization term
-        reg_term_f = torch.norm(Y[:, self.f_lt_indices], p=1, dim=1) #l1 regularization term
-        return self.obj_coeff @ Y.T + 0.1*(reg_term_md + reg_term_f)
+        return self.obj_coeff @ Y.T
+        # reg_term_md = torch.norm(Y[:, self.md_indices], p=1, dim=1) #l1 regularization term
+        # reg_term_f = torch.norm(Y[:, self.f_lt_indices], p=1, dim=1) #l1 regularization term
+        # return self.obj_coeff @ Y.T + 0.1*(reg_term_md + reg_term_f)
     
     def obj_fn_log(self, Y):
         # obj_coeff does not need batching, objective is the same over different samples.

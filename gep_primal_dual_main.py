@@ -168,7 +168,7 @@ if __name__ == "__main__":
             with open(os.path.join(save_dir, 'args.dict'), 'wb') as f:
                 pickle.dump(args, f)
 
-            target_path = f"outputs/Gurobi/Operational={args['operational']}_T={args['sample_duration']}_{args['G']}"
+            target_path = f"outputs/Gurobi/Operational={args['operational']}_T={args['sample_duration']}_Scale={args['scale_problem']}_{args['G']}_{args['L']}"
 
             # Prep problem data:
             data = prep_data(args=args, inputs=experiment_instance, target_path=target_path, operational=args['operational'])
