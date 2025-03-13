@@ -179,6 +179,10 @@ if __name__ == "__main__":
 
             # primal_net, dual_net = load(data, save_dir)
 
+            # Solve single sample with Benders decomposition
+            # sample = 0 # solution = Obj: 2374.99
+            compact = False
+            solve_with_benders(data, compact, sample)
             data.plot_balance(primal_net, dual_net)
             data.plot_decision_variable_diffs(primal_net, dual_net)
 
