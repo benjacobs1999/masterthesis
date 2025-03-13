@@ -197,5 +197,6 @@ if __name__ == "__main__":
 
             # Solve single sample with Benders decomposition
             # sample = 0 # solution = Obj: 2374.99
-            solve_with_benders(data, sample)
+            compact = False
+            solve_with_benders(data, compact, sample)
 
