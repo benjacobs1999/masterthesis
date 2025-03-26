@@ -3,6 +3,40 @@ import torch
 import pickle
 import matplotlib.pyplot as plt
 
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+
+
+class DataScaler:
+    def __init__(self, X, eq_cm, ineq_cm, eq_rhs, ineq_rhs):
+        # Store original data
+        self.X_raw = X
+        self.eq_rhs_raw = eq_rhs
+        self.ineq_rhs_raw = ineq_rhs
+        
+        # Calculate scaling factor for MW values
+        # Use a simple scale factor like 1000 (if values are in MW)
+        # or determine dynamically from data
+        self.mw_scale = self._determine_scale_factor(X)
+        
+        # Apply the same scaling to X and all RHS values
+        self.X = self._scale(X)
+        self.eq_rhs = self._scale(eq_rhs)
+        self.ineq_rhs = self._scale(ineq_rhs)
+        
+        # Don't scale coefficient matrices as they represent relationships
+        self.eq_cm = eq_cm
+        self.ineq_cm = ineq_cm
+    
+    def _determine_scale_factor(self, X):
+        return self.X_raw.mean()  # Example: scale down by 1000
+    
+    def _scale(self, values):
+        # Simple scaling without mean subtraction
+        return values / self.mw_scale
+    
+    def inverse_transform(self, scaled_values):
+        # Convert back to original scale
+        return scaled_values * self.mw_scale
 
 class GEPOperationalProblemSet():
 
@@ -12,9 +46,18 @@ class GEPOperationalProblemSet():
         # self.pUnitInvestment = [4130.05009001755, 11232.550865341998] # BEL/GER, SunPV
         # self.pUnitInvestment = [361.86402118882216, 0.0, 26.82598871780973, 164.8367340122868]
 
+        # if args["device"] == "mps":
+        #     self.DTYPE = torch.float32
+        #     self.DEVICE = torch.device("mps")
+        # else:
+        #     self.DTYPE = torch.float64
+        #     self.DEVICE = torch.device("cpu")
+        
         self.DTYPE = torch.float64
-        self.DEVICE = torch.device="cpu"
+        self.DEVICE = torch.device("cpu")
+
         torch.set_default_dtype(self.DTYPE)
+        torch.set_default_device(self.DEVICE)
 
         # Whether we will use Benders in compact form or not.
         self.benders_compact_form = args["benders_compact"]
@@ -27,6 +70,12 @@ class GEPOperationalProblemSet():
         self.train = args["train"]
         self.valid = args["valid"]
         self.test = args["test"]
+
+        # Number of samples to generate (through randomly chosen investment variables)
+        if args["num_synthetic_samples"] > 0:
+            self.n_samples = args["num_synthetic_samples"]
+        else:
+            self.n_samples = len(T) - 1
 
         # Input Sets
         self.T = T
@@ -75,11 +124,24 @@ class GEPOperationalProblemSet():
         self.ydim = self.n_prod_vars + self.n_line_vars + self.n_md_vars
 
         self._opt_targets = self.load_targets(target_path)
-        self.pUnitInvestment = self._opt_targets["y_investment"]
+        if args["num_synthetic_samples"] > 0:
+            self.pUnitInvestment = self.generate_ui_data(num_samples=self.n_samples)
+        else:
+            self.pUnitInvestment = self._opt_targets["y_investment"].to(self.DTYPE).to(self.DEVICE)
+        # self.pUnitInvestment = self.generate_ui_data(num_samples=self.n_samples)
+
+        #! Test with randomized optimal objectives: --> This breaks learning!
+        # self.pUnitInvestment = self.pUnitInvestment[torch.randperm(self.pUnitInvestment.shape[0])]
+
+        #! Test if missed demand is the problem: --> This does not break learning.
+        # self.pUnitInvestment *= 0.5
+
+        #! Test if max cap is the problem: --> This does break learning.
+        self.pUnitInvestment *= 2.0
 
         # Masks for node balance!
         # Initialize mask
-        self.node_to_gen_mask = torch.zeros((len(N), len(G)), dtype=torch.float64)
+        self.node_to_gen_mask = torch.zeros((len(N), len(G)), dtype=self.DTYPE)
 
         # Populate mask
         for g_idx, (node, _) in enumerate(G):
@@ -87,7 +149,7 @@ class GEPOperationalProblemSet():
             self.node_to_gen_mask[node_idx, g_idx] = 1
         
         # Initialize mask
-        self.lineflow_mask = torch.zeros((len(N), len(L)), dtype=torch.float64)
+        self.lineflow_mask = torch.zeros((len(N), len(L)), dtype=self.DTYPE)
 
         # Populate mask (directed adjacency matrix), -1 where line starts, 1 where line stops
         for l_idx, (start_node, end_node) in enumerate(L):
@@ -96,22 +158,38 @@ class GEPOperationalProblemSet():
             self.lineflow_mask[start_idx, l_idx] = -1
             self.lineflow_mask[end_idx, l_idx] = 1
         
+        self.md_indices = self.get_md_nt_indices()
+        self.f_lt_indices = self.get_f_lt_indices()
+
         # Create constraint matrices, rhs and obj_fns
         print("Populating ineq constraints")
         self.ineq_cm, self.ineq_rhs = self.build_ineq_cm_rhs()
         print("Populating eq constraints")
         self.eq_cm, self.eq_rhs = self.build_eq_cm_rhs()
         print("Creating objective coefficients")
-        self.obj_coeff, self.obj_coeff_log = self.build_obj_coeff()
+        self.obj_coeff, self.obj_coeff_log, self.obj_coeff_train = self.build_obj_coeff()
         self.X = self.build_X(self.eq_rhs, self.ineq_rhs)
+        # self.X = self.eq_rhs #! Test whether ineq_rhs gives extra information. --> It does, won't learn without it.
+            
+        # self.X = self.build_X_alternative()
         # self.X = torch.concat([self.eq_rhs, self.ineq_rhs], dim=1)
         self.xdim = self.X.shape[1]
 
         # Split x into training, val, test sets.
         self._split_X_in_sets(self.train, self.valid, self.test)
 
-        self.md_indices = self.get_md_nt_indices()
-        self.f_lt_indices = self.get_f_lt_indices()
+        if args["scale_input"]:
+            self.scaler = DataScaler(self.X, self.eq_cm, self.ineq_cm, self.eq_rhs, self.ineq_rhs)
+            self.X = self.scaler.X
+            self.eq_rhs = self.scaler.eq_rhs
+            self.ineq_rhs = self.scaler.ineq_rhs
+
+        if self.args["device"] == 'mps':
+            self.obj_coeff = self.obj_coeff.to(torch.float32).to(torch.device('mps'))
+            self.obj_coeff_log = self.obj_coeff_log.to(torch.float32).to(torch.device('mps'))
+            self.obj_coeff_train = self.obj_coeff_train.to(torch.float32).to(torch.device('mps'))
+            self.node_to_gen_mask = self.node_to_gen_mask.to(torch.float32).to(torch.device('mps'))
+            self.lineflow_mask = self.lineflow_mask.to(torch.float32).to(torch.device('mps'))
     
     # Split the data
     @property
@@ -127,7 +205,11 @@ class GEPOperationalProblemSet():
     def load_targets(self, target_path):
         with open(target_path, 'rb') as file:
             return pickle.load(file)
-        
+
+    def generate_ui_data(self, num_samples=10000, max_inv=100000):
+        exp_dist = torch.distributions.Exponential(rate=0.01)
+        return exp_dist.sample((num_samples, self.num_g))
+    
     def perturb_operating_costs(self, noise=0.01):
         """Perturbs the operating costs to remove symmetry in the solution space -- This stagnates the learning of the neural network.
 
@@ -306,8 +388,11 @@ class GEPOperationalProblemSet():
     def obj_fn_train(self, Y):
         # Objective function adjusted for training (different than the actual objective function)
         # Y = Y.clone()
+        # Y[:, self.md_indices] = torch.relu(Y[:, self.md_indices])
+        # Y[:, self.md_indices] = Y[:, self.md_indices]**2
+        # Y[:, self.md_indices] = 0
         # Y[:, self.md_indices] = Y[:, self.md_indices].abs()
-        return self.obj_coeff @ Y.T
+        return self.obj_coeff_train @ Y.T
         # reg_term_md = torch.norm(Y[:, self.md_indices], p=1, dim=1) #l1 regularization term
         # reg_term_f = torch.norm(Y[:, self.f_lt_indices], p=1, dim=1) #l1 regularization term
         # return self.obj_coeff @ Y.T + 0.1*(reg_term_md + reg_term_f)
@@ -333,7 +418,7 @@ class GEPOperationalProblemSet():
                          p_{g,tn}, f_{l,tn}, md_{n,tn}] """
 
         # coeff vector of zero's to be filled
-        c = torch.zeros(self.n_var_per_t*self.sample_duration, dtype=torch.float64)
+        c = torch.zeros(self.n_var_per_t*self.sample_duration, dtype=self.DTYPE)
 
         for t in range(self.sample_duration):
             # Sum over G,T (PC_g * p_{g,t}) --> Generation costs
@@ -351,9 +436,17 @@ class GEPOperationalProblemSet():
         if self.benders_compact_form:
             c_compact = torch.cat((torch.zeros(self.num_g), c), 0)
         else:
-            c_compact = c
+            c_compact = c.clone()
 
-        return c_compact, c
+        # During training, we don't want to penalize missed demand in the objective function, but in the loss function (augmented Lagrangian).
+        c_train = c.clone()
+        c_train[self.md_indices] = 0
+
+        # ! How does pWeight influence the primal/dual solutions??
+        # c_compact *= self.pWeight
+        # c *= self.pWeight
+
+        return c_compact, c, c_train
 
     def build_X(self, eq_rhs, ineq_rhs):
         """Builds a tensor containing the features that vary across problem instances. For now, only supports changes in RHS.
@@ -365,14 +458,28 @@ class GEPOperationalProblemSet():
         X = torch.concat([self.eq_rhs, self.ineq_rhs[:, ineq_rhs_varying_indices]], dim=1)
 
         return X
+    
+    def build_X_alternative(self,):
+        X = []
+        for t in range(1, self.n_samples - 1):
+            x = []
+            for idx, g in enumerate(self.G):
+                x.append(self.pUnitInvestment[t, idx])
+            for n in self.N:
+                x.append(self.pDemand[(n, t)])
+            for g in self.G:
+                x.append(self.pGenAva.get((*g, t), 1.0))
+            X.append(x)
+        return torch.tensor(X)
             
                 
     def build_ineq_cm_rhs(self,):
         ineq_cms = []
         ineq_rhss = []
 
-        for sample_idx, time_range in enumerate(self.time_ranges):
-            ineq_cm, ineq_rhs = self.build_ineq_cm_rhs_sample(time_range, sample_idx=sample_idx)
+        # for sample_idx, time_range in enumerate(self.time_ranges):
+        for sample_idx in range(self.n_samples):
+            ineq_cm, ineq_rhs = self.build_ineq_cm_rhs_sample(sample_idx=sample_idx)
             ineq_cms.append(ineq_cm)
             ineq_rhss.append(ineq_rhs)
         
@@ -382,8 +489,8 @@ class GEPOperationalProblemSet():
         eq_cms = []
         eq_rhss = []
 
-        for idx, time_range in enumerate(self.time_ranges):
-            eq_cm, eq_rhs = self.build_eq_cm_rhs_sample(time_range, idx)
+        for idx in range(self.n_samples):
+            eq_cm, eq_rhs = self.build_eq_cm_rhs_sample(idx)
             eq_cms.append(eq_cm)
             eq_rhss.append(eq_rhs)
         
@@ -398,14 +505,14 @@ class GEPOperationalProblemSet():
             matrix[row_start, col_start] = value
 
     # TODO: Change for compact form
-    def build_ineq_cm_rhs_sample(self, time_range, sample_idx):
+    def build_ineq_cm_rhs_sample(self, sample_idx):
         """For a single data sample characterised by the time_range, 
         build the full inequality constraint matrix for all timesteps using Kronecker product.
         """
 
         # TODO: Convert to sparse matrices for efficiency??
 
-        num_timesteps = len(time_range)
+        # num_timesteps = len(time_range)
         num_columns_per_t = self.n_var_per_t
 
         # Compute number of constraint rows per timestep
@@ -424,7 +531,8 @@ class GEPOperationalProblemSet():
         self.assign_identity_or_scalar(block_matrix, 2*self.num_g + 2*self.num_l + self.num_n, self.num_g + self.num_l, self.num_n, 1)  # 3.1j: Missed demand upper bound
 
         # Use Kronecker product to copy the block matrix diagonally for all timesteps
-        ineq_cm = torch.kron(torch.eye(num_timesteps), block_matrix)
+        #! Sample duration is always 1
+        ineq_cm = torch.kron(torch.eye(self.sample_duration), block_matrix)
 
         if self.benders_compact_form:
             # Append columns of zeroes (one for each generator), there are no inequality constraints on the investment variables
@@ -434,33 +542,36 @@ class GEPOperationalProblemSet():
         ineq_rhs = []
 
         # Create right hand side:
-        for t in time_range:
-            # 3.1h: Production lower bound
-            ineq_rhs += [0 for _ in range(self.num_g)]
-            # 3.1b: Production upper bound
-            ineq_rhs += [self.pGenAva.get((*g, t), 1.0) * self.pUnitCap[g] * self.pUnitInvestment[sample_idx, idx] for idx, g in enumerate(self.G)]
-            # 3.1d: Lineflow lower bound
-            ineq_rhs += [self.pImpCap[l] for l in self.L]
-            # 3.1e: Lineflow upper bound
-            ineq_rhs += [self.pExpCap[l] for l in self.L]
-            # 3.1i: Missed demand lower bound
-            ineq_rhs += [0 for _ in range(self.num_n)]
-            # 3.1j: Missed demand upper bound
-            ineq_rhs += [self.pDemand[(n, t)] for n in self.N]
+        # for t in time_range:
+
+        # If we have more synthetic samples than timesteps, keep it within bounds through modulo (start counting again from 0 once we go out of bounds)
+        t = (sample_idx % len(self.T)) + 1
+
+        # 3.1h: Production lower bound
+        ineq_rhs += [0 for _ in range(self.num_g)]
+        # 3.1b: Production upper bound
+        ineq_rhs += [self.pGenAva.get((*g, t), 1.0) * self.pUnitCap[g] * self.pUnitInvestment[sample_idx, idx] for idx, g in enumerate(self.G)]
+        # 3.1d: Lineflow lower bound
+        ineq_rhs += [self.pImpCap[l] for l in self.L]
+        # 3.1e: Lineflow upper bound
+        ineq_rhs += [self.pExpCap[l] for l in self.L]
+        # 3.1i: Missed demand lower bound
+        ineq_rhs += [0 for _ in range(self.num_n)]
+        # 3.1j: Missed demand upper bound
+        ineq_rhs += [self.pDemand[(n, t)] for n in self.N]
             
         return ineq_cm, torch.tensor(ineq_rhs)
 
-    def build_eq_cm_rhs_sample(self, time_range, sample_idx):
+    def build_eq_cm_rhs_sample(self, sample_idx):
         """Build the constraint matrix for the equality constraints
         """
-        # TODO: Convert to sparse matrix for efficiency??
-        num_timesteps = len(time_range)
+        # TODO: Change operational problem to remove slack variable.
 
         # p_{g}, f_in - f_out, md_n
         block_matrix = torch.concat([self.node_to_gen_mask, self.lineflow_mask, torch.eye(self.num_n)], dim=1)
 
         # Use Kronecker product to copy the block matrix diagonally for all timesteps
-        eq_cm = torch.kron(torch.eye(num_timesteps), block_matrix)
+        eq_cm = torch.kron(torch.eye(self.sample_duration), block_matrix)
 
         # If we are using the compact form, add ui_g to the constraint matrix. (for ui_g == UI_g constraints)
         if self.benders_compact_form:
@@ -475,8 +586,10 @@ class GEPOperationalProblemSet():
             eq_rhs += self.opt_targets["y_investment"][sample_idx].tolist()
 
         # Build right hand side:
-        for t in time_range:
-            eq_rhs += [self.pDemand[(n, t)] for n in self.N]
+        # If we have more synthetic samples than timesteps, keep it within bounds through modulo (start counting again from 0 once we go out of bounds)
+        t = (sample_idx % len(self.T)) + 1
+
+        eq_rhs += [self.pDemand[(n, t)] for n in self.N]
                 
         return eq_cm, torch.tensor(eq_rhs)
 
@@ -498,23 +611,23 @@ class GEPOperationalProblemSet():
         self._test_indices = indices[train_size+valid_size:]
 
         # Convert time_ranges to a tensor or use list comprehension
-        time_ranges_tensor = torch.tensor(self.time_ranges)
+        # time_ranges_tensor = torch.tensor(self.time_ranges)
 
         # Split time ranges
-        self.train_time_ranges = time_ranges_tensor[self.train_indices].tolist()
-        self.val_time_ranges = time_ranges_tensor[self.valid_indices].tolist()
-        self.test_time_ranges = time_ranges_tensor[self.test_indices].tolist()
+        # self.train_time_ranges = time_ranges_tensor[self.train_indices].tolist()
+        # self.val_time_ranges = time_ranges_tensor[self.valid_indices].tolist()
+        # self.test_time_ranges = time_ranges_tensor[self.test_indices].tolist()
 
         print(f"Size of train set: {train_size}")
         print(f"Size of val set: {valid_size}")
         print(f"Size of test set: {B - train_size - valid_size}")
     
     def total_prod(self, p_gt):
-        p_nt = torch.einsum('ng,bgt->bnt', self.node_to_gen_mask.to(dtype=torch.float64), p_gt)
+        p_nt = torch.einsum('ng,bgt->bnt', self.node_to_gen_mask.to(dtype=self.DTYPE), p_gt)
         return p_nt
     
     def net_flow(self, f_lt):
-        net_flow_nt = torch.einsum('nl,blt->bnt', self.lineflow_mask.to(dtype=torch.float64), f_lt)
+        net_flow_nt = torch.einsum('nl,blt->bnt', self.lineflow_mask.to(dtype=self.DTYPE), f_lt)
         return net_flow_nt
 
     def net_balance(self, p_gt, f_lt):

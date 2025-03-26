@@ -3,8 +3,12 @@ import numpy as np
 from gep_config_parser import *
 from data_wrangling import dataframe_to_dict
 import pyomo.environ as pyo
+from pyomo.environ import Var, Constraint
+from pyomo.repn import generate_standard_repn
 import torch
 import json
+
+import matplotlib.pyplot as plt
 
 DEVICE = 'cpu'
 
@@ -13,9 +17,6 @@ VISUALIZATION_FILE_NAME = "visualization.toml"
 
 HIGHS  = "HiGHS"
 GUROBI = "Gurobi"
-
-# SAMPLE_DURATION = 12 # 12 hours
-SAMPLE_DURATION = 24 # 1 day
 
 SCALE_FACTORS = {
     "pDemand": 1/1000,  # MW -> GW
@@ -57,7 +58,7 @@ elif optimizer_name == GUROBI:
 else:
     raise ValueError(f"{optimizer_name}: Not implemented")
 
-def prep_data(inputs, N=None, G=None, L=None, scale=True):
+def prep_data(args, inputs, N=None, G=None, L=None, scale=True):
         print("Wrangling the input data")
 
         # Extract sets
@@ -87,7 +88,7 @@ def prep_data(inputs, N=None, G=None, L=None, scale=True):
 
         # Extract scalar parameters
         pVOLL = inputs["value_of_lost_load"]
-        pWeight = inputs["representative_period_weight"] / (SAMPLE_DURATION / len(T))
+        pWeight = inputs["representative_period_weight"] / (args["sample_duration"] / len(T))
         pRamping = inputs["ramping_value"]
 
         # Extract generator parameters
@@ -387,7 +388,12 @@ def run_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pR
 
     # Formulate objective
     print("Formulating the objective")
-    model.obj = pyo.Objective(expr=model.vInvCost + model.vOpeCost, sense=pyo.minimize)
+    # model.obj = pyo.Objective(expr=model.vInvCost + model.vOpeCost, sense=pyo.minimize)
+    model.obj = pyo.Objective(expr=(sum(pInvCost[g] * pUnitCap[g] * model.vGenInv[g] for g in G) + 
+                                    pWeight * (sum(pVarCost[g] * model.vGenProd[g, t] for g in G for t in T) + sum(pVOLL * model.vLossLoad[n, t] for n in N for t in T))
+                                    ),
+                                    sense=pyo.minimize
+                                    )
 
     # Constraints
     print("Adding model constraints")
@@ -395,22 +401,22 @@ def run_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pR
     # Investment costs
     # Sum_{g in G} IC_g * UCAP_g * ui_g
     # Investment cost (€/MW) * capacity of a unit (MW) * nr of units = Investment cost at g (€)
-    def eInvCost_rule(model):
-        return model.vInvCost == sum(
-            pInvCost[g] * pUnitCap[g] * model.vGenInv[g] for g in G
-        )
-    model.eInvCost = pyo.Constraint(rule=eInvCost_rule)
+    # def eInvCost_rule(model):
+    #     return model.vInvCost == sum(
+    #         pInvCost[g] * pUnitCap[g] * model.vGenInv[g] for g in G
+    #     )
+    # model.eInvCost = pyo.Constraint(rule=eInvCost_rule)
 
-    # Operating costs
-    # WOP * (Sum_{g in G, t in T} (PC_g * p_{g, t}) + Sum_{n in N, t in T} (MDC * md_{n,t}))
-    # Period weight * (variable production cost (€/MWh) * energy generation (MW) + 
-    #                  cost of missed demand (€/MW) * missed demand (€/MW))
-    def eOpeCost_rule(model):
-        return model.vOpeCost == pWeight * (
-            sum(pVarCost[g] * model.vGenProd[g, t] for g in G for t in T)
-            + sum(pVOLL * model.vLossLoad[n, t] for n in N for t in T)
-        )
-    model.eOpeCost = pyo.Constraint(rule=eOpeCost_rule)
+    # # Operating costs
+    # # WOP * (Sum_{g in G, t in T} (PC_g * p_{g, t}) + Sum_{n in N, t in T} (MDC * md_{n,t}))
+    # # Period weight * (variable production cost (€/MWh) * energy generation (MW) + 
+    # #                  cost of missed demand (€/MW) * missed demand (€/MW))
+    # def eOpeCost_rule(model):
+    #     return model.vOpeCost == pWeight * (
+    #         sum(pVarCost[g] * model.vGenProd[g, t] for g in G for t in T)
+    #         + sum(pVOLL * model.vLossLoad[n, t] for n in N for t in T)
+    #     )
+    # model.eOpeCost = pyo.Constraint(rule=eOpeCost_rule)
 
     # (3.1b)
     # Ensure production never exceeds capacity
@@ -594,7 +600,7 @@ def run_operational_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL,
     # WOP * (Sum_{g in G, t in T} (PC_g * p_{g, t}) + Sum_{n in N, t in T} (MDC * md_{n,t}))
     # Period weight * (variable production cost (€/MWh) * energy generation (MW) + 
     #                  cost of missed demand (€/MW) * missed demand (€/MW))
-    def eOpeCost_rule(model):
+    def eOpeCost_rule(model): #! Should we add pWeight here, or not?
         return model.vOpeCost == (
             sum(pVarCost[g] * model.vGenProd[g, t] for g in G for t in T)
             + sum(pVOLL * model.vLossLoad[n, t] for n in N for t in T)
@@ -705,6 +711,124 @@ def get_variable_values_as_list(var):
         # For scalar variables
         return [var.value]
     
+def extract_constraint_matrix_split(model):
+    # Gather active variables and constraints.
+    var_list = list(model.component_data_objects(Var, active=True))
+    cons_list = list(model.component_data_objects(Constraint, active=True))
+    
+    # Build a dictionary mapping variable id to its index.
+    var_index = {id(var): i for i, var in enumerate(var_list)}
+    num_vars = len(var_list)
+    
+    # Lists to collect equality and inequality rows, RHS values, and inequality senses.
+    eq_rows = []
+    eq_rhs = []
+    ineq_rows = []
+    ineq_rhs = []
+    ineq_senses = []
+    
+    for con in cons_list:
+        repn = generate_standard_repn(con.body)
+        # Build row vector (size = num_vars) for the constraint.
+        row = np.zeros(num_vars)
+        for coef, var in zip(repn.linear_coefs, repn.linear_vars):
+            j = var_index.get(id(var))
+            if j is None:
+                raise KeyError("Variable not found in var_list")
+            row[j] = coef
+        
+        # Determine the RHS value and, for inequalities, the sense.
+        if con.equality:
+            rhs_val = con.upper - repn.constant
+            eq_rows.append(row)
+            eq_rhs.append(rhs_val)
+        elif con.has_ub() and not con.has_lb():
+            rhs_val = con.upper - repn.constant
+            ineq_rows.append(row)
+            ineq_rhs.append(rhs_val)
+            ineq_senses.append('<=')
+        elif con.has_lb() and not con.has_ub():
+            rhs_val = con.lower - repn.constant
+            ineq_rows.append(row)
+            ineq_rhs.append(rhs_val)
+            ineq_senses.append('>=')
+        else:
+            # For range constraints (both lower and upper defined), here we choose the upper bound,
+            # and mark it as 'range'. You could split these into two constraints if needed.
+            rhs_val = con.upper - repn.constant
+            ineq_rows.append(row)
+            ineq_rhs.append(rhs_val)
+            ineq_senses.append('range')
+    
+    # Convert collected rows to matrices/vectors.
+    eq_cm = np.array(eq_rows)
+    ineq_cm = np.array(ineq_rows)
+    eq_rhs = np.array(eq_rhs)
+    ineq_rhs = np.array(ineq_rhs)
+    
+    return eq_cm, ineq_cm, eq_rhs, ineq_rhs, ineq_senses
+
+def extract_obj_coeff(model):
+    # Get all active variables in the model
+    var_list = list(model.component_data_objects(Var, active=True))
+    # Create a dictionary mapping variable id to index.
+    var_index = {id(var): i for i, var in enumerate(var_list)}
+    num_vars = len(var_list)
+    
+    # Initialize the objective coefficient vector.
+    obj_coeff = np.zeros(num_vars)
+    
+    # Generate the standard representation of the objective expression.
+    repn_obj = generate_standard_repn(model.obj.expr)
+    
+    # Fill the coefficient vector.
+    for coef, var in zip(repn_obj.linear_coefs, repn_obj.linear_vars):
+        j = var_index.get(id(var))
+        if j is None:
+            raise KeyError("Variable not found in var_list for objective.")
+        obj_coeff[j] = coef
+    
+    return obj_coeff
+
+def solve_matrix_problem(eq_cm, ineq_cm, eq_rhs, ineq_rhs, obj_coeff):
+    import gurobipy as gp
+    from gurobipy import GRB
+
+    # Create a new model
+    m = gp.Model("Matrix problem")
+
+    # Create variables
+    x = m.addMVar(shape=len(obj_coeff), vtype=GRB.CONTINUOUS, name="x")
+
+    # Set objective
+    obj = np.array(obj_coeff)
+    print(obj)
+    m.setObjective(obj @ x, GRB.MINIMIZE)
+
+    # Add ineq constraints
+    A = np.array(ineq_cm)
+    b = np.array(ineq_rhs)
+    m.addConstr(A @ x <= b, name="ineq")
+
+    # print(A)
+    # print(b)
+
+    # Add eq constraints
+    A = np.array(eq_cm)
+    b = np.array(eq_rhs)
+    m.addConstr(A @ x == b, name="eq")
+
+    # print(A)
+    # print(b)
+
+    # Optimize model
+    m.optimize()
+
+    print(x.X)
+    print(f"Obj: {m.ObjVal:g}")
+
+    return x.X, m.ObjVal
+    
 if __name__ == "__main__":
     for i, experiment_instance in enumerate(experiment["experiments"]):
         # Setup output dataframe
@@ -713,20 +837,34 @@ if __name__ == "__main__":
         with open("config.json", "r") as file:
             args = json.load(file)
 
-        T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap = prep_data(experiment_instance, N=args["N"], G=args["G"], L=args["L"], scale=args["scale_problem"])
+        T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap = prep_data(args, experiment_instance, N=args["N"], G=args["G"], L=args["L"], scale=args["scale_problem"])
 
-        T_ranges = [range(i, i + SAMPLE_DURATION, 1) for i in range(1, len(T), SAMPLE_DURATION)]
+        T_ranges = [range(i, i + args["sample_duration"], 1) for i in range(1, len(T), args["sample_duration"])]
         for t in T_ranges[:1]:
             # Run one experiment for j repeats
             model, solver, time_taken = run_model_no_bounds(experiment_instance, t, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
+            # model, solver, time_taken = run_model(experiment_instance, t, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
             # model, solver, time_taken = run_operational_model_no_bounds(experiment_instance, t, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
             # print(get_variable_values_as_list(model.vGenInv))
-            print(f"Operating costs: {model.vOpeCost.value}")
+            # print(f"Operating costs: {model.vOpeCost.value}")
 
-            print("\nDUAL VALUES FOR ALL CONSTRAINTS:")
-            for c in model.component_objects(pyo.Constraint, active=True):
-                print(f"\nConstraint: {c.name}")
-                for index in c:
-                    if model.dual.get(c[index]) is not None:
-                        print(f"  {index}: Dual Value = {model.dual[c[index]]}")
+            eq_cm, ineq_cm, eq_rhs, ineq_rhs, ineq_senses = extract_constraint_matrix_split(model)
+            obj_coeff = extract_obj_coeff(model)
+            # print(ineq_senses)
+
+            sol, obj = solve_matrix_problem(eq_cm, ineq_cm, eq_rhs, ineq_rhs, obj_coeff)
+
+            print(model.obj())
+            print(obj)
+
+            # plot_matrix_values_and_rhs(A, b, senses)
+            # print(eq_cm)
+            # print(eq_rhs)
+
+            # print("\nDUAL VALUES FOR ALL CONSTRAINTS:")
+            # for c in model.component_objects(pyo.Constraint, active=True):
+            #     print(f"\nConstraint: {c.name}")
+            #     for index in c:
+            #         if model.dual.get(c[index]) is not None:
+            #             print(f"  {index}: Dual Value = {model.dual[c[index]]}")
     

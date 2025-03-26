@@ -16,11 +16,11 @@ VISUALIZATION_FILE_NAME = "visualization.toml"
 SCALE_FACTORS = {
     "pDemand": 1/1000,  # MW -> GW
     "pGenAva": 1,       # Don't scale
-    "pVOLL": 1/1000,         # kEUR/MWh -> mEUR/GWh
+    "pVOLL": 1000,         # kEUR/MWh -> mEUR/GWh
     "pWeight": 1,       # Don't scale
     "pRamping": 1,      # Don't scale
-    "pInvCost": 1/1000,      # kEUR/MW -> mEUR/GW
-    "pVarCost": 1/1000,      # kEUR/MWh -> mEUR/GWh
+    "pInvCost": 1000,      # kEUR/MW -> mEUR/GW
+    "pVarCost": 1000,      # kEUR/MWh -> mEUR/GWh
     "pUnitCap": 1/1000, # MW -> GW
     "pExpCap": 1/1000,  # MW -> GW
     "pImpCap": 1/1000,  # MW -> GW
@@ -178,11 +178,6 @@ if __name__ == "__main__":
             primal_net, dual_net, stats = trainer.train_PDL()
 
             # primal_net, dual_net = load(data, save_dir)
-
-            # Solve single sample with Benders decomposition
-            # sample = 0 # solution = Obj: 2374.99
-            compact = False
-            solve_with_benders(data, compact, sample)
             data.plot_balance(primal_net, dual_net)
             data.plot_decision_variable_diffs(primal_net, dual_net)
 
