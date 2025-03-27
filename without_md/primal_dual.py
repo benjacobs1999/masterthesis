@@ -5,17 +5,14 @@ import time
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, Dataset
-from logger import TensorBoardLogger
 import numpy as np
 from mtadam import MTAdam
-
+from logger import TensorBoardLogger
 torch.autograd.set_detect_anomaly(True)
 # torch.manual_seed(42)
-# Set the number of threads for intra-op parallelism (operations within a single task)
-torch.set_num_threads(4)  # Use 8 threads
 
-# For inter-op parallelism (executing independent operations in parallel)
-torch.set_num_interop_threads(4)  # Use 4 threads for independent operations
+# torch.set_num_threads(4)
+# torch.set_num_interop_threads(4)
 
 class IndexedDataset(Dataset):
     def __init__(self, X):
@@ -27,6 +24,7 @@ class IndexedDataset(Dataset):
 
     def __len__(self):
         return len(self.X)
+
         
 class PrimalDualTrainer():
 
@@ -131,6 +129,9 @@ class PrimalDualTrainer():
             self.dual_optim, mode='min', factor=self.decay, patience=self.patience
         )
 
+        known_missed_demand = self.data.opt_targets["y_operational"][:, self.data.md_indices]
+        assert known_missed_demand.sum() == 0, "Missed demand > 0 --> primal is infeasible, dual is unbounded"
+
     def freeze(self, network):
         """
         Create a frozen copy of a network
@@ -198,8 +199,8 @@ class PrimalDualTrainer():
                                 if k == 0:
                                     mu, lamb = torch.zeros_like(train_ineq_rhs), torch.zeros_like(train_eq_rhs)
                                 else:
-                                    # mu, lamb = frozen_dual_net(Xtrain, train_eq_cm)
-                                    mu, lamb = self.data.opt_targets["mu_operational"][sample_indices], self.data.opt_targets["lamb_operational"][sample_indices]
+                                    mu, lamb = frozen_dual_net(Xtrain, train_eq_cm)
+                                    # mu, lamb = self.data.opt_targets["mu_operational"][sample_indices], self.data.opt_targets["lamb_operational"][sample_indices]
                             batch_loss, obj, lagrange_eq, penalty = self.primal_loss(y, train_eq_cm, train_ineq_cm, train_eq_rhs, train_ineq_rhs, mu.detach(), lamb.detach())
                             batch_loss, obj, lagrange_eq, penalty = batch_loss.mean(), obj.mean(), lagrange_eq.mean(), penalty.mean()
                             total_train_loss += batch_loss.item()
@@ -263,16 +264,16 @@ class PrimalDualTrainer():
                             self.dual_optim.zero_grad()
                             mu, lamb = self.dual_net(Xtrain, train_eq_cm)
                             with torch.no_grad():
-                                mu_k, lamb_k = frozen_dual_net(Xtrain, train_eq_cm)
+                                # mu_k, lamb_k = frozen_dual_net(Xtrain, train_eq_cm)
                                 y = frozen_primal_net(Xtrain, train_eq_rhs, train_ineq_rhs)
                             # ! Test other loss!
                             # batch_loss = self.dual_loss(y, train_eq_cm, train_ineq_cm, train_eq_rhs, train_ineq_rhs, mu, lamb, mu_k, lamb_k).mean()
-                            batch_loss = self.dual_loss_changed(y, train_eq_cm, train_ineq_cm, train_eq_rhs, train_ineq_rhs, mu, lamb, mu_k, lamb_k).mean()
+                            batch_loss = self.dual_loss_changed(train_eq_rhs, train_ineq_rhs, mu, lamb).mean()
                             batch_loss.backward()
 
                             #! Test gradient clipping
                             if k > 2 and self.clip_gradients_norm > 0:
-                                torch.nn.utils.clip_grad_norm_(self.primal_net.parameters(), self.clip_gradients_norm)
+                                torch.nn.utils.clip_grad_norm_(self.dual_net.parameters(), self.clip_gradients_norm)
 
                             self.dual_optim.step()
                             total_train_loss += batch_loss.item()
@@ -336,39 +337,64 @@ class PrimalDualTrainer():
 
     def primal_loss(self, y, eq_cm, ineq_cm, eq_rhs, ineq_rhs, mu, lamb):
         obj = self.data.obj_fn_train(y)
-
-        #! Penalize missed demand in the objective function, and penalize inequality constraints in the loss function (double penalization)
-        if self.args["penalize_md_obj"]:
-            ineq = self.data.ineq_resid(y, ineq_cm, ineq_rhs)
-            lagrange_ineq = torch.sum(mu * ineq, dim=1).clamp(min=0)  # Shape (batch_size,)
-            violation_ineq = torch.sum(ineq.clamp(min=0) ** 2, dim=1)
-            penalty = self.rho/2 * violation_ineq
-            loss = obj + lagrange_ineq + penalty
-            return loss, obj, lagrange_ineq, penalty
-        #! Penalize missed demand only in the loss function (as if we don't have a slack variable)
-        else:
-            lagrange_eq = torch.sum(lamb * y[:, self.data.md_indices]).clamp(min=0)
-            violation_eq = torch.sum(y[:, self.data.md_indices] ** 2, dim=1)
-            penalty = self.rho/2 * violation_eq
-            # loss = (obj + (lagrange_eq + penalty))
-            loss = obj + penalty
-            # loss = penalty
-            return loss, obj, lagrange_eq, penalty
         
-        # violation_eq = torch.sum(eq ** 2, dim=1)
+        # g(y)
+        # ineq = self.data.ineq_resid(y, ineq_cm, ineq_rhs)
+        # h(y)
+        eq = self.data.eq_resid(y, eq_cm, eq_rhs)
+
+        # ! Clamp mu?
+        # Element-wise clamping of mu_i when g_i (ineq) is negative
+        # mu = torch.where(ineq < 0, torch.zeros_like(mu), mu)
+        # ! Clamp ineq_resid?
+        # ineq = ineq.clamp(min=0)
+
+        # lagrange_ineq = torch.sum(mu * ineq, dim=1)  # Shape (batch_size,)
+        # ! Clamp the lagrangian inequality term --> we do not adhere to KKT (why not?)
+        # lagrange_ineq = torch.sum(mu * ineq, dim=1).clamp(min=0)  # Shape (batch_size,)
+
+        lagrange_eq = torch.sum(lamb * eq, dim=1)   # Shape (batch_size,)
+
+        # violation_ineq = torch.sum(torch.maximum(ineq, torch.zeros_like(ineq)) ** 2, dim=1)
+        violation_eq = torch.sum(eq ** 2, dim=1)
         # penalty = self.rho/2 * (violation_ineq + violation_eq)
 
         # ! Alternative penalty: missed demand ** 2
         # lagrange_eq = torch.sum(lamb * y[:, self.data.md_indices])
         # violation_eq = torch.sum(y[:, self.data.md_indices] ** 2, dim=1)
-        # penalty = self.rho/2 * violation_eq
+        # violation_eq = torch.sum(y[:, self.data.md_indices].abs(), dim=1)
+
+        penalty = self.rho/2 * violation_eq
+
+        # ! Primal loss might need to be scaled to work.
+        # loss = (obj*1e3 + (lagrange_ineq + lagrange_eq + penalty))
+        # loss = (obj + (lagrange_ineq + lagrange_eq + penalty))
+
         # loss = (obj + (lagrange_eq.clamp(min=0) + penalty))
         # loss = penalty
-        # loss = (obj + penalty)
+        loss = (obj + penalty)
+
+        # loss = (obj*1e3 + penalty)
+
+
+        # relaxation_threshold = 0.01  # Allow 1% imbalance
+        # relaxed_penalty = torch.clamp(penalty - eq_rhs.abs().sum(dim=1) * relaxation_threshold, min=0)
+        # loss = obj + relaxed_penalty
+
+
+        #! Test with scaling the loss function
+        # penalty = violation_eq
+        # lagrange_eq = lagrange_eq.clamp(min=0)
+        # loss = (obj/obj.detach() + lagrange_eq/lagrange_eq.detach() + self.rho/2*(penalty/penalty.detach()))
+        # loss = (obj/obj.detach() + self.rho/2*(penalty/penalty.detach()))
+
+        # ! Test with term regularizing the distance between previous solution.
+        # reg = torch.norm(y - self.prev_solution)
+
+        #! Test only optimizing objective.
         # loss = obj
 
-        # return loss, obj, lagrange_eq.clamp(min=0), penalty
-        
+        return loss, obj, lagrange_eq.clamp(min=0), penalty
 
     def dual_loss(self, y, eq_cm, ineq_cm, eq_rhs, ineq_rhs, mu, lamb, mu_k, lamb_k):
         # mu = [batch, g]
@@ -397,11 +423,11 @@ class PrimalDualTrainer():
 
         return loss
     
-    def dual_loss_changed(self, y, eq_cm, ineq_cm, eq_rhs, ineq_rhs, mu, lamb, mu_k, lamb_k):
+    def dual_loss_changed(self, eq_rhs, ineq_rhs, mu, lamb):
         #! We maximize the dual obj func, so to use it in the loss, take the negation.
         dual_obj = -self.data.dual_obj_fn(eq_rhs, ineq_rhs, mu, lamb)
 
-        #! Dual constraints are never violated, so we do not include penalty and lagrangian terms.
+        #! Dual solutions are always feasible because of the completion step, so we do not include penalty and lagrangian terms.
         return dual_obj
 
     def violation(self, y, eq_cm, ineq_cm, eq_rhs, ineq_rhs, mu_k):
@@ -496,38 +522,42 @@ class DualNetEndToEnd(nn.Module):
             lamb_D_nt = lamb
             obj_coeff = self._data.obj_coeff
 
-        mu = obj_coeff - torch.bmm(eq_cm_D_nt.transpose(1, 2), lamb_D_nt.unsqueeze(-1)).squeeze(-1)
+        eq_cm = eq_cm[0]
 
-        mu = mu.view(mu.shape[0], self._data.sample_duration, -1)  # Shape: (batch_size, t, constraints)
+        # mu = obj_coeff - torch.bmm(eq_cm_D_nt.transpose(1, 2), lamb_D_nt.unsqueeze(-1)).squeeze(-1)
+        mu = obj_coeff - lamb @ eq_cm
+
+        # mu = mu.view(mu.shape[0], self._data.sample_duration, -1)  # Shape: (batch_size, t, constraints)
 
         # Compute lower and upper bound multipliers
         mu_lb = torch.relu(mu)   # Lower bound multipliers |mu|^+
         mu_ub = torch.relu(-mu)  # Upper bound multipliers |mu|^-
-
+        
         # Split into groups, following the exact structure of mu
-        p_g_lb = mu_lb[:, :, :self._data.num_g]  # Lower bounds for p_g
-        p_g_ub = mu_ub[:, :, :self._data.num_g]  # Upper bounds for p_g
+        p_g_lb = mu_lb[:, :self._data.num_g]  # Lower bounds for p_g
+        p_g_ub = mu_ub[:, :self._data.num_g]  # Upper bounds for p_g
 
-        f_l_lb = mu_lb[:, :, self._data.num_g:self._data.num_g + self._data.num_l]  # Lower bounds for f_l
-        f_l_ub = mu_ub[:, :, self._data.num_g:self._data.num_g + self._data.num_l]  # Upper bounds for f_l
+        # f_l_lb = mu_lb[:, :, self._data.num_g:self._data.num_g + self._data.num_l]  # Lower bounds for f_l
+        # f_l_ub = mu_ub[:, :, self._data.num_g:self._data.num_g + self._data.num_l]  # Upper bounds for f_l
+        f_l_lb = mu_lb[:, self._data.num_g:]  # Lower bounds for f_l
+        f_l_ub = mu_ub[:, self._data.num_g:]  # Upper bounds for f_l
 
-        md_n_lb = mu_lb[:, :, self._data.num_g + self._data.num_l:]  # Lower bounds for md_n
-        md_n_ub = mu_ub[:, :, self._data.num_g + self._data.num_l:]  # Upper bounds for md_n
+        # md_n_lb = mu_lb[:, :, self._data.num_g + self._data.num_l:]  # Lower bounds for md_n
+        # md_n_ub = mu_ub[:, :, self._data.num_g + self._data.num_l:]  # Upper bounds for md_n
 
         # Reshape back into (batch_size, constraints * t) while maintaining order
         out_mu = torch.cat([
             p_g_lb, p_g_ub,  # Lower and Upper bounds for p_g
             f_l_lb, f_l_ub,  # Lower and Upper bounds for f_l
-            md_n_lb, md_n_ub  # Lower and Upper bounds for md_n
-        ], dim=-1).reshape(mu.shape[0], -1)  # Flatten back to (batch_size, constraints * t)
-
+            # md_n_lb, md_n_ub  # Lower and Upper bounds for md_n
+        ], dim=-1).reshape(lamb.shape[0], -1)  # Flatten back to (batch_size, constraints * t)
         return out_mu
-        
         
     def forward(self, x, eq_cm):
         out_lamb = self.feed_forward(x)
         out_mu = self.complete_duals(out_lamb, eq_cm)
-
+        # print(out_mu)
+        # print(out_lamb)
         return out_mu, out_lamb
 
 class DualNet(nn.Module):
@@ -730,7 +760,8 @@ class PrimalNetEndToEnd(nn.Module):
             ui_g, p_gt, f_lt = self._data.split_dec_vars_from_Y_raw(x_out)
             
             # [B, bounds, T]
-            p_gt_lb, p_gt_ub, f_lt_lb, f_lt_ub, md_nt_lb, md_nt_ub = self._data.split_ineq_constraints(ineq_rhs)
+            # p_gt_lb, p_gt_ub, f_lt_lb, f_lt_ub, md_nt_lb, md_nt_ub = self._data.split_ineq_constraints(ineq_rhs)
+            p_gt_lb, p_gt_ub, f_lt_lb, f_lt_ub = self._data.split_ineq_constraints(ineq_rhs)
 
             p_gt_bound_repaired = self.bound_repair_layer(p_gt, p_gt_lb, p_gt_ub)
             # print(p_gt)
@@ -741,12 +772,12 @@ class PrimalNetEndToEnd(nn.Module):
 
 
             #! Test without slack.
-            UI_g, D_nt = self._data.split_eq_constraints(eq_rhs)
-            md_nt = self.estimate_slack_layer(p_gt_bound_repaired, f_lt_bound_repaired, D_nt)
+            # UI_g, D_nt = self._data.split_eq_constraints(eq_rhs)
+            # md_nt = self.estimate_slack_layer(p_gt_bound_repaired, f_lt_bound_repaired, D_nt)
 
-            y = torch.cat([p_gt_bound_repaired, f_lt_bound_repaired, md_nt], dim=1).permute(0, 2, 1).reshape(x_out.shape[0], -1)
+            # y = torch.cat([p_gt_bound_repaired, f_lt_bound_repaired, md_nt], dim=1).permute(0, 2, 1).reshape(x_out.shape[0], -1)
 
-            # y = torch.cat([p_gt_bound_repaired, f_lt_bound_repaired], dim=1).permute(0, 2, 1).reshape(x_out.shape[0], -1)
+            y = torch.cat([p_gt_bound_repaired, f_lt_bound_repaired], dim=1).permute(0, 2, 1).reshape(x_out.shape[0], -1)
 
             if self._data.args["benders_compact"]:
                 y = torch.cat([ui_g, y], dim=1)
