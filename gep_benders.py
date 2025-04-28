@@ -9,7 +9,7 @@ import time
 
 from gep_problem import GEPProblemSet
 from gep_problem_operational import GEPOperationalProblemSet
-from gep_primal_dual_main import prep_data
+from create_gep_dataset import prep_data
 from primal_dual import load
 from gep_config_parser import *
 
@@ -85,7 +85,8 @@ class BendersSolver():
         # Create variables
         ydim = obj.size()[0]
         if master:
-            vtypes = np.array([GRB.INTEGER for _ in range(ydim-1)])
+            # vtypes = np.array([GRB.INTEGER for _ in range(ydim-1)])
+            vtypes = np.array([GRB.CONTINUOUS for _ in range(ydim-1)]) #! For now, test with continuous variables. We can do integer later.
             vtypes = np.append(vtypes,GRB.CONTINUOUS)
         else:
             vtypes = np.array([GRB.CONTINUOUS for _ in range(ydim)])
@@ -123,10 +124,10 @@ class BendersSolver():
 
     def solve_matrix_problem_PDL(self, obj, A_ineq, b_ineq, A_eq, b_eq, time_step):
         # For ineq RHS, only 3.1b varies across instances --> first |G| constraints are 3.1h, second |G| constraints are 3.1b.
-        ineq_rhs_varying_indices = [t * self.operational_data.n_ineq_per_t + self.operational_data.num_g + i for t in range(self.operational_data.sample_duration) for i in range(self.operational_data.num_g)]
+        # ineq_rhs_varying_indices = [t * self.operational_data.nineq + self.operational_data.num_g + i for t in range(self.operational_data.sample_duration) for i in range(self.operational_data.num_g)]
 
         # The entire RHS changes for equality constraints
-        X = torch.concat([b_eq, b_ineq[ineq_rhs_varying_indices]]).unsqueeze(0)
+        X = torch.concat([b_eq, b_ineq]).unsqueeze(0)
 
         # print(f"X: {X}")
         # print(f"trained_X: {self.operational_data.X[sample*24+time_step]}")
@@ -134,8 +135,8 @@ class BendersSolver():
         # print(X - self.operational_data.X[sample*24+time_step])
 
 
-        primal_sol = self.primal_net(X, b_eq.unsqueeze(0), b_ineq.unsqueeze(0))
-        mu, lamb = dual_net(X, A_eq.unsqueeze(0))
+        primal_sol = self.primal_net(X)
+        mu, lamb = dual_net(X)
         # mu, lamb = self.dual_net(X, data.eq_cm[:1])
 
         # mu = -mu
@@ -145,19 +146,19 @@ class BendersSolver():
 
         exact_obj_val, exact_primal_val, exact_dual_val = self.solve_matrix_problem_simple(obj, A_ineq, b_ineq, A_eq, b_eq, False)
 
-        dual_sol = torch.concat([mu.detach(), lamb.detach()], dim=1).squeeze().detach().numpy()
+        dual_sol = torch.concat([mu, lamb], dim=1).squeeze()
 
         # exact_mu = exact_dual_val[:mu.shape[1]]
         # exact_lamb = exact_dual_val[mu.shape[1]:]
 
         #! Negative mu evaluates to the same as dual obj value as from the prediction. This is also the same as the primal obj value.
-        dual_obj_exact = self.operational_data.dual_obj_fn(b_eq.unsqueeze(0), b_ineq.unsqueeze(0), -torch.tensor(exact_dual_val[:mu.shape[1]]).unsqueeze(0), torch.tensor(exact_dual_val[mu.shape[1]:]).unsqueeze(0))
+        dual_obj_exact = self.operational_data.dual_obj_fn(X, -torch.tensor(exact_dual_val[:mu.shape[1]]).unsqueeze(0), torch.tensor(exact_dual_val[mu.shape[1]:]).unsqueeze(0))
 
         # self.operational_data.dual_obj_fn(b_eq.unsqueeze(0), b_ineq.unsqueeze(0), torch.tensor(exact_dual_val[:mu.shape[1]]).unsqueeze(0), torch.tensor(exact_dual_val[mu.shape[1]:]).unsqueeze(0))
 
-        dual_obj = self.operational_data.dual_obj_fn(b_eq.unsqueeze(0), b_ineq.unsqueeze(0), mu*self.operational_data.pWeight, lamb*self.operational_data.pWeight)
+        dual_obj = self.operational_data.dual_obj_fn(X, mu*self.operational_data.pWeight, lamb*self.operational_data.pWeight)
 
-        print((dual_obj - dual_obj_exact)/dual_obj_exact)
+        print(f"Dual optimality gap: {((dual_obj - dual_obj_exact)/dual_obj_exact).item()}")
         # self.operational_data.dual_obj_fn(b_eq.unsqueeze(0), b_ineq.unsqueeze(0), -mu*self.operational_data.pWeight, lamb*self.operational_data.pWeight)
 
         #! This is only correct in the first sample. why?
@@ -166,18 +167,16 @@ class BendersSolver():
         primal_sol *= self.operational_data.pWeight
         obj_val = self.operational_data.obj_fn(primal_sol)
 
-        print((obj_val - exact_obj_val)/exact_obj_val)
+        print(f"Primal optimality gap: {((obj_val - exact_obj_val)/exact_obj_val).item()}")
 
         #! b_ineq might differ from what the model has been trained on. --> because the investment variables are different
 
         dual_sol *= self.operational_data.pWeight
 
-
-
         # dual_sol = exact_dual_val
         # dual_sol[:mu.shape[1]] *= -1
 
-        return obj_val.detach().numpy().item(), primal_sol.squeeze().detach().numpy(), dual_sol
+        return obj_val.detach().numpy().item(), primal_sol.squeeze().detach().numpy(), dual_sol.detach().numpy()
 
     def solve_master_problem(self, data,compact,sample,investments,obj_val,benders_cuts):
         # Solves the master problem in Benders decomposition
@@ -241,19 +240,19 @@ class BendersSolver():
         num_timesteps = len(time_range)
         
         obj_val_total = 0
+        obj_val_exact = 0
         benders_cut_lhs = torch.zeros((1,data.num_g+1)) #coefficients for ui_g and for alpha
         benders_cut_lhs[0,-1] = -1 # coeff for alpha: -1
         benders_cut_rhs = 0
+
+        benders_cut_lhs_exact = torch.zeros((1,data.num_g+1)) #coefficients for ui_g and for alpha
+        benders_cut_lhs_exact[0,-1] = -1 # coeff for alpha: -1
+        benders_cut_rhs_exact = 0
 
         for time_step in range(num_timesteps):
 
             # Find constraint matrices, right hand side vectors and objective vector of subproblem
             obj, A_ineq, b_ineq, A_eq, b_eq = self.find_subproblem_cm_rhs_obj(data,compact,sample,investments,time_step)
-            obj_prev, A_ineq_prev, b_ineq_prev, A_eq_prev, b_eq_prev = self.find_subproblem_cm_rhs_obj(data,compact,sample,investments,time_step)
-
-            assert torch.equal(obj, obj_prev)
-            assert torch.equal(A_ineq, A_ineq_prev)
-            assert torch.equal(A_eq, A_eq_prev)
 
             # Solve subproblem
             obj_val_original, primal_val_original, dual_val_original = self.solve_matrix_problem_simple(obj, A_ineq, b_ineq, A_eq, b_eq, False)
@@ -278,21 +277,31 @@ class BendersSolver():
             # print(f"PDL obj: {obj_val}, Exact obj: {obj_val_original}")
             # print(obj_val - obj_val_original)
             # print('-'*10)
-            obj_val = obj_val_original
-            primal_val = primal_val_original
-            dual_val = dual_val_original
+            # obj_val = obj_val_original
+            # primal_val = primal_val_original
+            # dual_val = dual_val_original
 
             # Add objective value to the total
             obj_val_total += obj_val
+            obj_val_exact += obj_val_original
 
             # Find coefficients of Benders cut and add to current cut
             benders_cut_lhs, benders_cut_rhs = self.find_benders_cut(data, compact, sample, investments, 
                                                                 (benders_cut_lhs, benders_cut_rhs), 
                                                                 time_step, b_ineq, b_eq, obj_val, dual_val)
+            benders_cut_lhs_exact, benders_cut_rhs_exact = self.find_benders_cut(data, compact, sample, investments, 
+                                                                (benders_cut_lhs_exact, benders_cut_rhs_exact), 
+                                                                time_step, b_ineq, b_eq, obj_val_original, dual_val_original)
+            
             
         # Obtain the final Benders cut of all subproblems together
-        benders_cut = benders_cut_lhs, benders_cut_rhs
-
+        if self.exact:
+            benders_cut = benders_cut_lhs, benders_cut_rhs
+        else:
+            benders_cut = -benders_cut_lhs, benders_cut_rhs #! Negate lhs to get correct cut if we are predicting (if self.exact = False)
+        benders_cut_exact = benders_cut_lhs_exact, benders_cut_rhs_exact
+        print(f"Benders cut: {benders_cut}")
+        print(f"Benders cut exact: {benders_cut_exact}")
         return obj_val_total, benders_cut
 
     def find_subproblem_cm_rhs_obj(self, data,compact,sample,investments,time_step):
@@ -399,13 +408,13 @@ class BendersSolver():
 
         # Start Benders algorithm
         optimal = False
-        iter = 0
-        while not optimal:
-
-            print("Iteration", iter)
+        i = 0
+        while not optimal and i < 100:
+            print("-"*50)
+            print("Iteration", i)
 
             # Find the investment decisions
-            if iter == 0:
+            if i == 0:
                 # Generate initial investment solution
                 investments_iter_k = [0. for _ in range(data.num_g)] #TODO find better initial solution?
                 # investments_iter_k = self.operational_data.opt_targets['y_investment'][0] #! Test with optimal solution
@@ -416,7 +425,7 @@ class BendersSolver():
                 obj_val_master = [obj_val_master, 0] # alpha is zero in the first iteration
             else:
                 # Solve master problem to find investments
-                print("Solving the master problem in iteration", iter)
+                print("Solving the master problem in iteration", i)
                 obj_val_master, investments_iter_k = self.solve_master_problem(data,compact,sample,torch.stack(investments_all),torch.tensor(obj_val_subproblems_all),benders_cut_all)
 
             # Add investment values of current iteration to list
@@ -445,10 +454,10 @@ class BendersSolver():
             if upper_bound - lower_bound < epsilon:
                 optimal = True
                 print('Done! Optimal solution found')
-                print('Total number of iterations needed:', iter)
+                print('Total number of iterations needed:', i)
                 print('Optimal objective value:', upper_bound)
 
-            iter += 1
+            i += 1
             
         return
 
@@ -488,12 +497,14 @@ if __name__ == "__main__":
             operational_data = prep_data(args=args, inputs=experiment_instance, target_path=target_path_operational, operational=True)
 
             # Load primal and dual net
-            model_dir = "benders_models"
-            primal_net, dual_net = load(operational_data, model_dir)
+            model_dir = "benders_models/1-node-1-generator"
+            primal_net, dual_net = load(args, operational_data, model_dir)
             primal_net.eval(), dual_net.eval()
+            # primal_net = None
+            # dual_net = None
 
             # Solve single sample with matrix formulation
-            sample = 0 # only solve first sample for now
+            sample = 1 # only solve first sample for now
             exact = False
             solver = BendersSolver(gep_data=gep_data, operational_data=operational_data, primal_net=primal_net, dual_net=dual_net, sample=sample, exact=exact)
             y, obj = solver.solve_matrix_problem(gep_data, sample) # solution = Obj: 2374.99

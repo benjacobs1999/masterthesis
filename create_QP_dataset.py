@@ -1,9 +1,10 @@
+import json
 import numpy as np
 import pickle
 
 from QP_problem import *
 
-def create_QP_dataset(num_var, num_ineq, num_eq, num_examples):
+def create_QP_dataset(num_var, num_ineq, num_eq, num_examples, path):
     np.random.seed(17)
     Q = np.diag(np.random.random(num_var))
     p = np.random.random(num_var)
@@ -14,14 +15,33 @@ def create_QP_dataset(num_var, num_ineq, num_eq, num_examples):
 
     problem = OriginalQPProblem(Q, p, A, G, X, h)
     problem.calc_Y()
+    problem.dual_calc_Y()
     print(len(problem.Y))
 
-    with open("./QP_data/QP_simple_dataset_var{}_ineq{}_eq{}_ex{}".format(num_var, num_ineq, num_eq, num_examples), 'wb') as f:
+    with open(path, 'wb') as f:
         pickle.dump(problem, f)
     
     return problem
 
-def create_varying_G_dataset(num_var, num_ineq, num_eq, num_examples, vary):
+def create_nonconvex_QP_dataset(num_var, num_ineq, num_eq, num_examples, path):
+    np.random.seed(17)
+    Q = np.diag(np.random.random(num_var))
+    p = np.random.random(num_var)
+    A = np.random.normal(loc=0, scale=1., size=(num_eq, num_var))
+    X = np.random.uniform(-1, 1, size=(num_examples, num_eq))
+    G = np.random.normal(loc=0, scale=1., size=(num_ineq, num_var))
+    h = np.sum(np.abs(G@np.linalg.pinv(A)), axis=1)
+
+    problem = NonconvexQPProblem(Q, p, A, G, X, h)
+    problem.calc_Y()
+    print(len(problem.Y))
+
+    with open(path, 'wb') as f:
+        pickle.dump(problem, f)
+    
+    return problem
+
+def create_varying_G_dataset(num_var, num_ineq, num_eq, num_examples, vary, save_path):
     """Creates a modified QP data set that differs in the inequality constraint matrix, instead of the RHS variables.
     """
     np.random.seed(17)
@@ -31,8 +51,11 @@ def create_varying_G_dataset(num_var, num_ineq, num_eq, num_examples, vary):
     # X is the same for all samples:
     b = np.random.uniform(-1, 1, size=(num_eq))
     G = np.random.normal(loc=0, scale=1., size=(num_ineq, num_var))
-    d = np.sum(np.abs(G@np.linalg.pinv(A)), axis=1)
 
+    #! Note that because each G will be different, d is no longer ensured to be feasible. However, in practice, each d is still feasible.
+    d = np.sum(np.abs(G@np.linalg.pinv(A)), axis=1) 
+
+    # Input to be inserted into G
     X = np.random.normal(loc=0, scale=1., size=(num_examples, num_ineq))
 
     # Try first with changing a single row!
@@ -45,12 +68,34 @@ def create_varying_G_dataset(num_var, num_ineq, num_eq, num_examples, vary):
     if vary == 'random':
         col_indices = np.random.choice(num_var, num_ineq, replace=False)
         row_indices = np.random.choice(num_ineq, num_ineq, replace=True)
+    
 
     problem = QPProblemVaryingG(X=torch.tensor(X), Q=Q, p=p, A=A, G=G, b=b, d=d, row_indices=row_indices, col_indices=col_indices)
     problem.calc_Y()
     print(len(problem.Y))
 
-    with open("./QP_data/Varying_G_type={}_dataset_var{}_ineq{}_eq{}_ex{}".format(vary, num_var, num_ineq, num_eq, num_examples), 'wb') as f:
+    with open(save_path, 'wb') as f:
+        pickle.dump(problem, f)
+    
+    return problem
+
+def create_varying_Q_dataset(num_var, num_ineq, num_eq, num_examples, save_path):
+    np.random.seed(17)
+    Q = np.diag(np.random.random(num_var))
+    p = np.random.random(num_var)
+    A = np.random.normal(loc=0, scale=1., size=(num_eq, num_var))
+    G = np.random.normal(loc=0, scale=1., size=(num_ineq, num_var))
+    b = np.random.uniform(-1, 1, size=(num_eq))
+    d = np.sum(np.abs(G@np.linalg.pinv(A)), axis=1)
+
+    X = np.random.random(size=(num_examples, num_eq))
+    indices = np.random.choice(num_var, num_eq, replace=False)
+
+    problem = QPProblemVaryingQ(torch.tensor(X), Q, p, A, G, b, d, indices)
+    problem.calc_Y()
+    print(len(problem.Y))
+
+    with open(save_path, 'wb') as f:
         pickle.dump(problem, f)
     
     return problem
@@ -86,7 +131,7 @@ def create_varying_G_b_d_dataset(num_var, num_ineq, num_eq, num_examples, num_va
     problem.calc_Y()
     print(len(problem.Y))
 
-    with open("./QP_data/modified/MODIFIED_random_simple_dataset_var{}_ineq{}_eq{}_ex{}".format(num_var, num_ineq, num_eq, num_examples), 'wb') as f:
+    with open("./data/QP_data/modified/MODIFIED_random_simple_dataset_var{}_ineq{}_eq{}_ex{}".format(num_var, num_ineq, num_eq, num_examples), 'wb') as f:
         pickle.dump(problem, f)
     
     return problem
@@ -96,8 +141,13 @@ if __name__ == "__main__":
     num_ineq = 50
     num_eq = 50
     num_examples = 10000
-    
-    original_data = create_QP_dataset(num_var, num_ineq, num_eq, num_examples)
-    varying_cm_row_data = create_varying_G_dataset(num_var, num_ineq, num_eq, num_examples, vary='row')
-    varying_cm_column_data = create_varying_G_dataset(num_var, num_ineq, num_eq, num_examples, vary='column')
-    varying_cm_random_data = create_varying_G_dataset(num_var, num_ineq, num_eq, num_examples, vary='random')
+    args = json.load(open("config.json"))
+    QP_args = args['QP_args']
+    QP_type = QP_args['type']
+
+    # original_data = create_QP_dataset(num_var, num_ineq, num_eq, num_examples)
+    # varying_cm_row_data = create_varying_G_dataset(num_var, num_ineq, num_eq, num_examples, vary='row')
+    # varying_cm_column_data = create_varying_G_dataset(num_var, num_ineq, num_eq, num_examples, vary='column')
+    # varying_cm_random_data = create_varying_G_dataset(num_var, num_ineq, num_eq, num_examples, vary='random')  
+    # varying_Q_data = create_varying_Q_dataset(num_var, num_ineq, num_eq, num_examples)
+    create_nonconvex_QP_dataset(num_var, num_ineq, num_eq, num_examples, f"data/QP_data/QP_type:nonconvex_var:{QP_args['var']}_ineq:{QP_args['ineq']}_eq:{QP_args['eq']}_num_samples:{QP_args['num_samples']}.pkl")

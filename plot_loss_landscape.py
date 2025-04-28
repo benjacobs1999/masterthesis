@@ -10,7 +10,7 @@ import time
 
 from gep_config_parser import *
 from primal_dual import PrimalDualTrainer, load
-from gep_primal_dual_main import prep_data
+from create_gep_dataset import prep_data
 
 from torchviz import make_dot
 from IPython.display import display

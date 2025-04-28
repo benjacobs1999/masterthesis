@@ -8,9 +8,9 @@ class GEPProblemSet():
 
     def __init__(self, args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, target_path):
         self.DTYPE = torch.float64
-        self.DEVICE = torch.device="cpu"
+        self.DEVICE = torch.device("cpu")
         torch.set_default_dtype(self.DTYPE)
-
+        torch.set_default_device(self.DEVICE)
         # Args:
         self.args = args
         self.sample_duration = args["sample_duration"]
@@ -196,7 +196,6 @@ class GEPProblemSet():
         return torch.bmm(ineq_cm, Y.unsqueeze(-1)).squeeze(-1) - ineq_rhs
 
     def eq_resid(self, Y, eq_cm, eq_rhs):
-        torch.bmm(eq_cm, Y.unsqueeze(-1)).squeeze(-1)
         return torch.bmm(eq_cm, Y.unsqueeze(-1)).squeeze(-1) - eq_rhs
     
     #! Enforce this with a ReLU.
@@ -424,7 +423,7 @@ if __name__ == "__main__":
 
     from gep_config_parser import *
 
-    from gep_primal_dual_main import prep_data
+    from create_gep_dataset import prep_data
 
     CONFIG_FILE_NAME        = "config.toml"
     VISUALIZATION_FILE_NAME = "visualization.toml"
