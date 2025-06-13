@@ -1,4 +1,4 @@
-# masterthesis
+# Self-Supervised Learning with Formal Guarantees for Energy Systems Optimization: Primal-Dual Solutions, Objective Bounds, and Benders Cuts
 
 ### Environment
 To create an environment with the correct packages, type the following commands in the terminal:
