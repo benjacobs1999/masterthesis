@@ -11,39 +11,6 @@ from gep_config_parser import parse_config
 from gep_problem import GEPProblemSet
 from scipy.stats import qmc
 
-# TODO: Move scaling to trainer class.
-# class DataScaler:
-#     def __init__(self, X, eq_cm, ineq_cm, eq_rhs, ineq_rhs):
-#         # Store original data
-#         self.X_raw = X
-#         self.eq_rhs_raw = eq_rhs
-#         self.ineq_rhs_raw = ineq_rhs
-        
-#         # Calculate scaling factor for MW values
-#         # Use a simple scale factor like 1000 (if values are in MW)
-#         # or determine dynamically from data
-#         self.mw_scale = self._determine_scale_factor(X)
-        
-#         # Apply the same scaling to X and all RHS values
-#         self.X = self._scale(X)
-#         self.eq_rhs = self._scale(eq_rhs)
-#         self.ineq_rhs = self._scale(ineq_rhs)
-        
-#         # Don't scale coefficient matrices as they represent relationships
-#         self.eq_cm = eq_cm
-#         self.ineq_cm = ineq_cm
-    
-#     def _determine_scale_factor(self, X):
-#         return self.X_raw.mean()  # Example: scale down by 1000
-    
-#     def _scale(self, values):
-#         # Simple scaling without mean subtraction
-#         return values / self.mw_scale
-    
-#     def inverse_transform(self, scaled_values):
-#         # Convert back to original scale
-#         return scaled_values * self.mw_scale
-
 class GEPOperationalProblemSet():
 
     def __init__(self, args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap):
@@ -58,19 +25,14 @@ class GEPOperationalProblemSet():
         torch.set_default_dtype(self.DTYPE)
         torch.set_default_device(self.DEVICE)
 
-        # Whether we will use Benders in compact form or not.
-        self.benders_compact_form = args["benders_compact"]
-
         # Args:
         self.args = args
+        self.ED_args = args["ED_args"]
         # Operation sample is always of length 1 for benders!
         self.sample_duration = 1
-        self.train = args["train"]
-        self.valid = args["valid"]
-        self.test = args["test"]
 
         # Number of samples to generate (through randomly chosen investment variables)
-        self.n_samples = 2 ** args["2n_synthetic_samples"]
+        self.n_samples = 2 ** self.ED_args["2n_synthetic_samples"]
 
         # Input Sets
         self.T = T
@@ -96,8 +58,8 @@ class GEPOperationalProblemSet():
 
 
         # Value can be None (we don't perturb) or a percentage (we perturb by that percentage)
-        if self.args['perturb_operating_costs']:
-            self.pVarCost = self.perturb_operating_costs(self.args['perturb_operating_costs'])
+        if self.ED_args['perturb_operating_costs']:
+            self.pVarCost = self.perturb_operating_costs(self.ED_args['perturb_operating_costs'])
         
         # Number variables, variables are [p_g, f_l, md_n]
         self.n_vars = self.num_g + self.num_l + self.num_n
@@ -116,22 +78,10 @@ class GEPOperationalProblemSet():
         self.ydim = self.n_prod_vars + self.n_line_vars + self.n_md_vars
 
         # Generate unit investment data:
-        self.pUnitInvestment = self.generate_ui_data(m=args["2n_synthetic_samples"], max_inv=args["max_investment"])
+        self.pUnitInvestment = self.generate_ui_data(m=self.ED_args["2n_synthetic_samples"], max_inv=self.ED_args["max_investment"])
+        # self.pUnitInvestment = self.sparsify_batch(self.pUnitInvestment) #! This is likely not necessary, unsparsified data set already contains the data.
 
-        # else:
-        #     self._opt_targets = self.load_targets(target_path)
-        #     self.pUnitInvestment = self._opt_targets["y_investment"].to(self.DTYPE).to(self.DEVICE)
-
-        #! Test with randomized optimal objectives: --> This breaks learning!
-        # self.pUnitInvestment = self.pUnitInvestment[torch.randperm(self.pUnitInvestment.shape[0])]
-
-        #! Test if missed demand is the problem: --> This does not break learning.
-        # self.pUnitInvestment *= 0.5
-
-        #! Test if max cap is the problem: --> This does not break learning.
-        # self.pUnitInvestment *= 2.0
-
-        # Masks for node balance!
+        # Masks for node balance
         # Initialize mask
         self.node_to_gen_mask = torch.zeros((len(N), len(G)), dtype=self.DTYPE)
 
@@ -163,12 +113,12 @@ class GEPOperationalProblemSet():
         self.eq_cm = self.build_eq_cm()
         print("Creating objective coefficients")
         self.obj_coeff, self.cost_vec = self.build_obj_coeff()
-        if self.args["synthetic_demand_capacity"]:
+        if self.ED_args["synthetic_demand_capacity"]:
             self.X = self.build_synthetic_X()
         else:
             self.X = self.build_X()
         
-        if self.args["normalize_input"]:
+        if self.ED_args["normalize_input"]:
             self.total_demands = self.X[:, :self.data.num_n].sum(dim=1).unsqueeze(1)
             self.X /= self.total_demands
         else:
@@ -176,8 +126,7 @@ class GEPOperationalProblemSet():
 
         self.xdim = self.X.shape[1]
 
-        if args["opt_targets"]:
-            self.opt_targets = self.compute_opt_targets()
+        self.opt_targets = self.compute_opt_targets()
 
         # if self.args["device"] == 'mps':
             # self.obj_coeff = self.obj_coeff.to(torch.float32).to(torch.device('mps'))
@@ -219,6 +168,37 @@ class GEPOperationalProblemSet():
        #! TODO: Do we need samples to be exactly 0?
 
         return points
+
+    def sparsify_batch(self, X):
+        """
+        Given a batch of decision vectors X (shape: [batch_size, dim]),
+        zero out elements to make each row k-sparse, where k ∈ num_active_range.
+        """
+        batch_size, dim = X.shape
+        num_active_range=(1, self.num_g) #! TODO: This should be a parameter, in larger spaces we probably want more investment decisions to be zero.
+        # Number of active (non-zero) entries per row
+        num_active = torch.randint(num_active_range[0], num_active_range[1] + 1, (batch_size,))
+
+        # Generate random scores to select top-k indices
+        scores = torch.rand(batch_size, dim)
+
+        # Sort and zero out all but top-k entries per row
+        sorted_scores, sorted_indices = torch.sort(scores, dim=1, descending=True)
+
+        # Create binary mask with top-k indices set to 1
+        row_indices = torch.arange(batch_size).unsqueeze(1)
+        mask = torch.zeros_like(X, dtype=torch.bool)
+        for i in range(num_active_range[0], num_active_range[1] + 1):
+            sel = (num_active == i)
+            if sel.any():
+                topk_indices = sorted_indices[sel][:, :i]
+                batch_rows = torch.arange(topk_indices.size(0)).unsqueeze(1)
+                mask[sel] = mask[sel].scatter(1, topk_indices, True)
+
+        # Apply the mask
+        X_sparse = X * mask
+
+        return X_sparse
     
     def perturb_operating_costs(self, noise=0.01):
         """Perturbs the operating costs to remove symmetry in the solution space -- This stagnates the learning of the neural network.
@@ -308,13 +288,13 @@ class GEPOperationalProblemSet():
 
             Returns c
         """
-        # If we are using compact form, we have ui_g = UI_G constraints prepended.
-        if self.benders_compact_form and not log:
-            ui_g = eq[:, :self.num_g]
-            c = eq[:, self.num_g:]
-        else:
-            ui_g = None
-            c = eq
+        # # If we are using compact form, we have ui_g = UI_G constraints prepended.
+        # if self.benders_compact_form and not log:
+        #     ui_g = eq[:, :self.num_g]
+        #     c = eq[:, self.num_g:]
+        # else:
+        ui_g = None
+        c = eq
         return ui_g, c
 
     # TODO: Change for compact form
@@ -326,11 +306,11 @@ class GEPOperationalProblemSet():
         """
         batch_size = Y.shape[0]  # Get batch size
 
-        if self.benders_compact_form:
-            ui_g = Y[:, :self.num_g]
-            Y = Y[:, self.num_g:]
-        else:
-            ui_g = None
+        # if self.benders_compact_form:
+        #     ui_g = Y[:, :self.num_g]
+        #     Y = Y[:, self.num_g:]
+        # else:
+        ui_g = None
 
         # Reshape Y for efficient slicing
         Y = Y.view(batch_size, self.n_vars - self.num_n)
@@ -352,8 +332,8 @@ class GEPOperationalProblemSet():
         batch_size = Y.shape[0]  # Get batch size
 
         # Remove benders compact form handling if needed
-        if self.benders_compact_form and not log:
-            Y = Y[:, self.num_g:]
+        # if self.benders_compact_form and not log:
+        #     Y = Y[:, self.num_g:]
 
         # Define segment sizes
         sizes = [self.num_g, self.num_l, self.num_n]
@@ -363,6 +343,8 @@ class GEPOperationalProblemSet():
         p_gt, f_lt, md_nt = torch.split(Y, sizes, dim=1)
 
         return p_gt, f_lt, md_nt
+    
+
 
     def ineq_resid(self, X, Y):
         eq_rhs, ineq_rhs = self.split_X(X)
@@ -374,7 +356,7 @@ class GEPOperationalProblemSet():
 
     def eq_resid(self, X, Y):
         eq_rhs, ineq_rhs = self.split_X(X)
-        return eq_rhs - Y @ self.eq_cm.T
+        return Y @ self.eq_cm.T - eq_rhs
     
     def dual_ineq_resid(self, mu, lamb):
         """Dual inequality Residual, takes on the form:
@@ -385,7 +367,8 @@ class GEPOperationalProblemSet():
     def dual_eq_resid(self, mu, lamb):
         """Dual equality Residual, takes on the form:
             G^T \mu + H^T \lambda + c = 0"""
-        return self.obj_coeff - (lamb @ self.eq_cm - mu @ self.ineq_cm)
+        # return self.obj_coeff - (lamb @ self.eq_cm - mu @ self.ineq_cm)
+        return mu @ self.ineq_cm + lamb @ self.eq_cm + self.obj_coeff
 
     def obj_fn(self, X, Y):
         # obj_coeff does not need batching, objective is the same over different samples.
@@ -396,37 +379,60 @@ class GEPOperationalProblemSet():
         cost = self.cost_vec @ p_gt.T
 
         load_shedding = self.pVOLL * torch.norm(md_nt, p=1, dim=1)
-        # load_shedding = self.pVOLL * md_nt.sum(dim=1)
 
         return  cost + load_shedding
-        # return self.obj_coeff @ Y.T
-    
-    # def obj_fn_train(self, Y):
-    #     # Objective function adjusted for training (different than the actual objective function)
-    #     # Y = Y.clone()
-    #     # Y[:, self.md_indices] = torch.relu(Y[:, self.md_indices])
-    #     # Y[:, self.md_indices] = Y[:, self.md_indices]**2
-    #     # Y[:, self.md_indices] = torch.max(Y[:, self.md_indices], torch.zeros_like(Y[:, self.md_indices]))
-    #     # Y[:, self.md_indices] = Y[:, self.md_indices].abs()
-    #     return self.obj_coeff_train @ Y.T
-    #     # reg_term_md = torch.norm(Y[:, self.md_indices], p=1, dim=1) #l1 regularization term
-    #     # reg_term_f = torch.norm(Y[:, self.f_lt_indices], p=1, dim=1) #l1 regularization term
-    #     # return self.obj_coeff @ Y.T + 0.1*(reg_term_md + reg_term_f)
-    
-    # def obj_fn_log(self, Y):
-    #     # obj_coeff does not need batching, objective is the same over different samples.
-    #     return self.obj_coeff_log @ Y.T
     
     def dual_obj_fn(self, X, mu, lamb):
         eq_rhs, ineq_rhs = self.split_X(X)
         # Batched dot product
         ineq_term = torch.sum(mu * ineq_rhs, dim=1)
-        # ineq_term = mu @ ineq_rhs.T
         # Batched dot product
-        # eq_term = lamb @ eq_rhs.T
         eq_term = torch.sum(lamb * eq_rhs, dim=1)
-        return eq_term - ineq_term
-        # return eq_term + ineq_term
+        return -eq_term - ineq_term
+
+    def relative_ineq_resid(self, X, Y):
+        """Relative inequality residuals. Based on Ch.4.4.3, metrics
+            
+        """
+        ineq_resid = self.ineq_resid(X, Y)
+        _, ineq_rhs = self.split_X(X)
+        p_gt_lb_resid, p_gt_ub_resid, f_lt_lb_resid, f_lt_ub_resid, md_nt_lb_resid, md_nt_ub_resid = self.split_ineq_constraints(ineq_resid)
+
+        p_gt_lb, p_gt_ub, f_lt_lb, f_lt_ub, md_nt_lb, md_nt_ub = self.split_ineq_constraints(ineq_rhs)
+
+        p_gt = p_gt_ub - p_gt_lb
+        # Production can have lower bound and upper bound = 0, resulting in division by zero.
+        # Default to 1 to avoid division by zero.
+        p_gt = torch.where(p_gt == 0, torch.ones_like(p_gt), p_gt)
+
+        f_lt = f_lt_ub + f_lt_lb # For flows, add them, because lb is actually negative, but positive in the RHS.
+        md_nt = md_nt_ub - md_nt_lb
+        
+
+        p_gt_lb_resid = p_gt_lb_resid / p_gt
+        p_gt_ub_resid = p_gt_ub_resid / p_gt
+        f_lt_lb_resid = f_lt_lb_resid / f_lt
+        f_lt_ub_resid = f_lt_ub_resid / f_lt
+        md_nt_lb_resid = md_nt_lb_resid / md_nt
+        md_nt_ub_resid = md_nt_ub_resid / md_nt
+
+        return torch.concat([p_gt_lb_resid, p_gt_ub_resid, f_lt_lb_resid, f_lt_ub_resid, md_nt_lb_resid, md_nt_ub_resid], dim=1)
+    
+    def relative_ineq_dist(self, X, Y):
+        ineq_resid = self.relative_ineq_resid(X, Y)
+        ineq_resid = torch.clamp(ineq_resid, 0)
+        return ineq_resid
+
+    def relative_eq_resid(self, X, Y):
+        """Relative equality residuals. Based on Ch.4.4.3, metrics"""
+        eq_resid = self.eq_resid(X, Y)
+        eq_rhs, _ = self.split_X(X)
+
+        _, demand = self.split_eq_constraints(eq_rhs)
+        
+        eq_resid = eq_resid.abs() / demand.abs()    
+
+        return eq_resid
     
     def build_obj_coeff(self,):
         """ Builds the objective function coefficients (only the operating costs)
@@ -450,10 +456,6 @@ class GEPOperationalProblemSet():
                 # Missed demand variables come after generator and lineflow variables
                 coeff_idx = t * self.n_vars + self.num_g + self.num_l + idx_n
                 obj_coeff[coeff_idx] = self.pVOLL
-
-        # ! How does pWeight influence the primal/dual solutions??
-        # c_compact *= self.pWeight
-        # c *= self.pWeight
 
         return obj_coeff, cost_vec
 
@@ -488,7 +490,10 @@ class GEPOperationalProblemSet():
                 p_gt_ub = self.pUnitInvestment[i, g_idx] * self.pUnitCap[g] * self.pGenAva.get((*g, t), 1.0)
                 Xi.append(p_gt_ub)
             X.append(Xi)
+        X = np.array(X)
+        np.random.shuffle(X)
         X = torch.tensor(X)
+        
         return X
     
     def build_synthetic_X(self):
@@ -524,13 +529,10 @@ class GEPOperationalProblemSet():
         else:
             matrix[row_start, col_start] = value
 
-    # TODO: Change for compact form
     def build_ineq_cm_rhs(self):
         """For a single data sample characterised by the time_range, 
         build the full inequality constraint matrix for all timesteps using Kronecker product.
         """
-
-        # TODO: Convert to sparse matrices for efficiency??
 
         # num_timesteps = len(time_range)
         num_columns_per_t = self.n_vars
@@ -582,7 +584,6 @@ class GEPOperationalProblemSet():
     def build_eq_cm(self):
         """Build the constraint matrix for the equality constraints
         """
-        # TODO: Change operational problem to remove slack variable.
 
         # p_{g}, f_in - f_out, md_n
         eq_cm = torch.concat([self.node_to_gen_mask, self.lineflow_mask, torch.eye(self.num_n)], dim=1)
@@ -609,14 +610,6 @@ class GEPOperationalProblemSet():
         self._train_indices = indices[:train_size]
         self._valid_indices = indices[train_size:train_size+valid_size]
         self._test_indices = indices[train_size+valid_size:]
-
-        # Convert time_ranges to a tensor or use list comprehension
-        # time_ranges_tensor = torch.tensor(self.time_ranges)
-
-        # Split time ranges
-        # self.train_time_ranges = time_ranges_tensor[self.train_indices].tolist()
-        # self.val_time_ranges = time_ranges_tensor[self.valid_indices].tolist()
-        # self.test_time_ranges = time_ranges_tensor[self.test_indices].tolist()
 
         print(f"Size of train set: {train_size}")
         print(f"Size of val set: {valid_size}")
@@ -817,9 +810,9 @@ class GEPOperationalProblemSet():
         for i in range(len(self.X)):
             y_operational, obj_operational, dual_eq, dual_ineq = solve_matrix_problem_simple(obj_coeff, eq_cm, ineq_cm, eq_rhs[i], ineq_rhs[i])
             y.append(torch.tensor(y_operational, dtype=self.DTYPE))
-            #! Negate duals for the inequality constraints, for some reason these are flipped in Gurobi.
+            #! Negate duals, these are flipped in Gurobi.
             mu.append(torch.tensor(-dual_ineq, dtype=self.DTYPE))
-            lamb.append(torch.tensor(dual_eq, dtype=self.DTYPE))
+            lamb.append(torch.tensor(-dual_eq, dtype=self.DTYPE))
             obj.append(torch.tensor(obj_operational, dtype=self.DTYPE))
         
         return {
@@ -865,162 +858,3 @@ def solve_matrix_problem_simple(obj_coeff, eq_cm, ineq_cm, eq_rhs, ineq_rhs, ver
         return x.X, m.ObjVal, dual_eq, dual_ineq
     else:
         raise RuntimeError(f"Optimization failed with status {m.Status}")
-    
-
-
-if __name__ == "__main__":
-    import json
-
-    ## Step 1: parse the input data
-    print("Parsing the config file")
-    CONFIG_FILE_NAME = "config.toml"
-    data = parse_config(CONFIG_FILE_NAME)
-    experiment = data["experiment"]
-    outputs_config = data["outputs_config"]
-
-    with open("config.json", "r") as file:
-        args = json.load(file)
-    
-    print(args)
-
-    # Train the model:
-    for i, experiment_instance in enumerate(experiment["experiments"]):
-        # Setup output dataframe
-        df_res = pd.DataFrame(columns=["setup_time", "presolve_time", "barrier_time", "crossover_time", "restore_time", "objective_value"])
-
-        for j in range(experiment["repeats"]):
-            # Run one experiment for j repeats
-            run_name = f"refactored_train:{args['train']}_rho:{args['rho']}_rhomax:{args['rho_max']}_alpha:{args['alpha']}_L:{args['alpha']}"
-            save_dir = os.path.join('outputs', 'PDL',
-                run_name + "-" + str(time.time()).replace('.', '-'))
-            if not os.path.exists(save_dir):
-                os.makedirs(save_dir)
-            with open(os.path.join(save_dir, 'args.dict'), 'wb') as f:
-                pickle.dump(args, f)
-
-            target_path = f"outputs/Gurobi/Operational={args['operational']}_T={args['sample_duration']}_Scale={args['scale_problem']}_{args['G']}_{args['L']}"
-            inputs = experiment_instance
-            # Prep problem data:
-            print("Wrangling the input data")
-
-            # Extract sets
-            T = inputs["times"] # [1, 2, 3, ... 8760] ---> 8760
-            N = args["N"]
-            G = args["G"]
-            L = args["L"]
-
-            if not (N or G or L):
-                G = inputs["generators"] # [('Country1', 'EnergySource1'), ...] ---> 107
-                L = inputs["transmission_lines"] # [('Country1', 'Country2'), ...] ---> 44
-                N = inputs["nodes"] # ['Country1', 'Country2', ...] ---> 20
-            else:
-                # Convert to tuples
-                # N = [tuple(pair) for pair in N]
-                G = [tuple(pair) for pair in G]
-                L = [tuple(pair) for pair in L]
-
-            # Extract time series data
-            pDemand = dataframe_to_dict(
-                inputs["demand_data"],
-                keys=["Country", "Time"],
-                value="Demand_MW"
-            )
-            
-            pGenAva = dataframe_to_dict(
-                inputs["generation_availability_data"],
-                keys=["Country", "Technology", "Time"],
-                value="Availability_pu"
-            )
-
-            # Extract scalar parameters
-            pVOLL = inputs["value_of_lost_load"]
-
-            # WOP
-            # Scale inversely proportional to times (T)
-            pWeight = inputs["representative_period_weight"] / (args["sample_duration"] / 8760)
-
-            pRamping = inputs["ramping_value"]
-
-            # Extract generator parameters
-            pInvCost = dataframe_to_dict(
-                inputs["generation_data"],
-                keys=["Country", "Technology"],
-                value="InvCost_kEUR_MW_year"
-            )
-
-            pVarCost = dataframe_to_dict(
-                inputs["generation_data"],
-                keys=["Country", "Technology"],
-                value="VarCost_kEUR_per_MWh"
-            )
-
-            pUnitCap = dataframe_to_dict(
-                inputs["generation_data"],
-                keys=["Country", "Technology"],
-                value="UnitCap_MW"
-            )
-
-            # Extract line parameters
-            pExpCap = dataframe_to_dict(
-                inputs["transmission_lines_data"],
-                keys=["CountryA", "CountryB"],
-                value="ExpCap_MW"
-            )
-
-            pImpCap = dataframe_to_dict(
-                inputs["transmission_lines_data"],
-                keys=["CountryA", "CountryB"],
-                value="ImpCap_MW"
-            )
-
-            # if args["scale_problem"]:
-            #     pDemand = scale_dict(pDemand, SCALE_FACTORS["pDemand"])
-            #     pGenAva = scale_dict(pGenAva, SCALE_FACTORS["pGenAva"])
-            #     pVOLL *= SCALE_FACTORS["pVOLL"]
-            #     pWeight *= SCALE_FACTORS["pWeight"]
-            #     pRamping *= SCALE_FACTORS["pRamping"]
-            #     pInvCost = scale_dict(pInvCost, SCALE_FACTORS["pInvCost"])
-            #     pVarCost = scale_dict(pVarCost, SCALE_FACTORS["pVarCost"])
-            #     pUnitCap = scale_dict(pUnitCap, SCALE_FACTORS["pUnitCap"])
-            #     pExpCap = scale_dict(pExpCap, SCALE_FACTORS["pExpCap"])
-            #     pImpCap = scale_dict(pImpCap, SCALE_FACTORS["pImpCap"])
-
-
-            # We need to sort the dictionaries for changing to tensors!
-            # pDemand = dict(sorted(pDemand.items()))
-            # pGenAva = dict(sorted(pGenAva.items()))
-            # pInvCost = dict(sorted(pInvCost.items()))
-            # pVarCost = dict(sorted(pVarCost.items()))
-            # pUnitCap = dict(sorted(pUnitCap.items()))
-            # pExpCap = dict(sorted(pExpCap.items()))
-            # pImpCap = dict(sorted(pImpCap.items()))
-
-            # if not os.path.exists(target_path):
-            #     time_ranges = [range(i, i + args["sample_duration"], 1) for i in range(1, len(T), args["sample_duration"])]
-            #     save_opt_targets(args, inputs, target_path, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, time_ranges)
-
-
-            print("Creating problem instance")
-            if args["operational"]:
-                data = GEPOperationalProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, target_path=target_path)
-            else:
-                data = GEPProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, target_path=target_path)
-
-            known_objs = data.obj_fn(data.X, data.opt_targets["y_operational"])
-            known_dual_objs = data.dual_obj_fn(data.eq_rhs, data.ineq_rhs, data.opt_targets["mu_operational"], data.opt_targets["lamb_operational"])
-            # for i in range(len(data.X)):
-            for i in range(1):
-                x, obj, dual_eq, dual_ineq = solve_matrix_problem_simple(data.obj_coeff.numpy(), data.eq_cm.numpy(), data.ineq_cm.numpy(), data.eq_rhs[i].numpy(), data.ineq_rhs[i].numpy(), False)
-                assert abs(obj - known_objs[i]) < 1e-9, f"Objective value mismatch at index {i}: {obj} != {known_objs[i]}"
-                # print(known_dual_objs[i:i+1])
-                # print(data.dual_obj_fn(data.eq_rhs[i:i+1], data.ineq_rhs[i:i+1], torch.tensor(dual_ineq).unsqueeze(0), torch.tensor(dual_eq).unsqueeze(0)))
-                # print(data.obj_coeff)
-                # print(dual_eq)
-                # print(data.opt_targets["lamb_operational"][i:i+1])
-                # print(dual_ineq)
-                # print(data.opt_targets["mu_operational"][i:i+1])
-                # print(data.eq_rhs[i:i+1])
-                # print(data.ineq_rhs[i:i+1])
-                # print(5336.3813 * 0.05 + 33061.6701 * 0.15)
-                calc_obj_fn = data.dual_obj_fn(data.eq_rhs[i:i+1], data.ineq_rhs[i:i+1], -torch.tensor(dual_ineq).unsqueeze(0), torch.tensor(dual_eq).unsqueeze(0))
-                assert abs(known_objs[i] - calc_obj_fn.item()) < 1e-9, f"Dual objective value mismatch at index {i}: {known_objs[i]} != {calc_obj_fn.item()}"

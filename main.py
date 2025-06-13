@@ -4,6 +4,7 @@ import json
 import os
 import time
 import pickle
+import optuna
 
 from primal_dual import PrimalDualTrainer
 from create_gep_dataset import create_gep_ed_dataset
@@ -22,12 +23,12 @@ if __name__ == "__main__":
     assert args["problem_type"] in ["ED", "GEP", "QP"], "Problem type must be either 'ED', 'GEP', or 'QP'"
 
 
-    run_name = f"train:{args['train']}_rho:{args['rho']}_rhomax:{args['rho_max']}_alpha:{args['alpha']}_L:{args['alpha']}"
+    run_name = f"learn_primal:{args['learn_primal']}_train:{args['train']}_rho:{args['rho']}_rhomax:{args['rho_max']}_alpha:{args['alpha']}_L:{args['alpha']}"
     save_dir = os.path.join('outputs', 'PDL', args['problem_type'], run_name + "-" + str(time.time()).replace('.', '-'))
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
-    with open(os.path.join(save_dir, 'args.dict'), 'wb') as f:
-        pickle.dump(args, f)
+    with open(os.path.join(save_dir, 'args.json'), 'w') as f:
+        json.dump(args, f, indent=4)
             
     if args["problem_type"] == "QP":
         if QP_args['random_hyperparams']:
@@ -77,7 +78,7 @@ if __name__ == "__main__":
                 if not os.path.exists(curr_repeat_save_dir):
                     os.makedirs(curr_repeat_save_dir)
                 trainer = PrimalDualTrainer(data, args, curr_repeat_save_dir)
-                primal_net, dual_net, stats = trainer.train_PDL()
+                primal_net, dual_net = trainer.train_PDL()
     
     else:
         ED_args = args["ED_args"]
@@ -111,19 +112,61 @@ if __name__ == "__main__":
         if not os.path.exists(data_save_path):
             directory = os.path.dirname(data_save_path)
             os.makedirs(directory, exist_ok=True)
-            data = create_gep_ed_dataset(args=ED_args, inputs=gep_ed_data, problem_type=args["problem_type"], save_path=data_save_path)
+            data = create_gep_ed_dataset(args=args, problem_args=ED_args, inputs=gep_ed_data, problem_type=args["problem_type"], save_path=data_save_path)
 
         # Load data:
         with open(data_save_path, 'rb') as file:
             data = pickle.load(file)
 
-        for repeat in range(ED_args["repeats"]):
-            curr_repeat_save_dir = os.path.join(save_dir, f"repeat:{repeat}")
-            os.makedirs(curr_repeat_save_dir, exist_ok=True)
-            # Run PDL
-            trainer = PrimalDualTrainer(data, args, curr_repeat_save_dir)
-            primal_net, dual_net, stats = trainer.train_PDL()
+        if args["Optuna_args"]["optuna"]:
+            # Tune the hyperparameters using Optuna:
+            optuna_args = args["Optuna_args"]
+            # Don't log to tensorboard for Optuna trials, it will be too slow.
+            args["log"] = False
+            def objective(trial):
+                # Suggest hyperparameters with Optuna
+                if args["learn_primal"]:
+                    args["primal_lr"] = trial.suggest_float("primal_lr", *optuna_args["primal_lr"])
+                if args["learn_dual"]:
+                    args["dual_lr"] = trial.suggest_float("dual_lr", *optuna_args["dual_lr"])
+                args["hidden_size_factor"] = trial.suggest_int("hidden_size_factor", *optuna_args["hidden_size_factor"])
+                args["n_layers"] = trial.suggest_int("n_layers", *optuna_args["n_layers"])
+                args["decay"] = trial.suggest_float("decay", *optuna_args["decay"])
+                args["batch_size"] = trial.suggest_categorical("batch_size", optuna_args["batch_size"])
 
-        # primal_net, dual_net = load(data, save_dir)
-        # data.plot_balance(primal_net, dual_net)
-        # data.plot_decision_variable_diffs(primal_net, dual_net)
+                trial_save_dir = os.path.join(save_dir, f"optuna_trial:{trial.number}")
+                os.makedirs(trial_save_dir, exist_ok=True)
+
+                trainer = PrimalDualTrainer(data, args, trial_save_dir)
+                primal_net, dual_net, primal_loss, dual_loss = trainer.train_PDL(trial)
+
+                if args["learn_primal"]:
+                    return primal_loss
+                elif args["learn_dual"]:
+                    return dual_loss
+                else:
+                    raise ValueError("Must learn either primal or dual")
+
+            pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2000, interval_steps=10)
+            study = optuna.create_study(direction="minimize", pruner=pruner)
+            study.optimize(objective, n_trials=optuna_args["optuna_trials"])
+            df = study.trials_dataframe()
+            df.to_csv(os.path.join(save_dir, "optuna_trials.csv"), index=False)
+            print("Best trial:", study.best_trial.params)
+        else:
+
+            #! Use best-found hyperparameters using Optuna
+            if args["learn_primal"]:
+                best_args = {'primal_lr': 0.0006785456069117277, 'hidden_size_factor': 28, 'n_layers': 2, 'decay': 0.9989743016070536, 'batch_size': 2048}
+                args["primal_lr"] = best_args["primal_lr"]
+                args["hidden_size_factor"] = best_args["hidden_size_factor"]
+                args["n_layers"] = best_args["n_layers"]
+                args["decay"] = best_args["decay"]
+                args["batch_size"] = best_args["batch_size"]
+
+            for repeat in range(ED_args["repeats"]):
+                curr_repeat_save_dir = os.path.join(save_dir, f"repeat:{repeat}")
+                os.makedirs(curr_repeat_save_dir, exist_ok=True)
+                # Run PDL
+                trainer = PrimalDualTrainer(data, args, curr_repeat_save_dir)
+                primal_net, dual_net, primal_loss, dual_loss, train_time = trainer.train_PDL()

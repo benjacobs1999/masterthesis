@@ -6,7 +6,10 @@ class PrimalNet(nn.Module):
     def __init__(self, args, data):
         super().__init__()
         self.data = data
-        self.hidden_sizes = [int(args["hidden_size_factor"]*data.xdim)] * args["n_layers"]
+        if args["hidden_size"]:
+            self.hidden_sizes = [int(args["hidden_size"])] * args["n_layers"]
+        else:
+            self.hidden_sizes = [int(args["hidden_size_factor"]*data.xdim)] * args["n_layers"]
         
         # Create the list of layer sizes
         layer_sizes = [data.xdim] + self.hidden_sizes + [data.ydim]
@@ -35,19 +38,16 @@ class PrimalNet(nn.Module):
         else:
             return self.net(x)
 
-
-class DualNetEndToEnd(nn.Module):
-    def __init__(self, args, data, hidden_size_factor=5.0, n_layers=4):
+class DualNet(nn.Module):
+    def __init__(self, args, data):
         super().__init__()
         self.data = data
-        self.hidden_sizes = [int(hidden_size_factor*data.xdim)] * n_layers
-        self.args = args
-        self.ED_args = args["ED_args"]
-
-        if self.ED_args["benders_compact"]:
-            self.out_dim = data.num_g + data.neq
+        if args["hidden_size"]:
+            self.hidden_sizes = [int(args["hidden_size"])] * args["n_layers"]
         else:
-            self.out_dim = data.neq
+            self.hidden_sizes = [int(args["hidden_size_factor"]*data.xdim)] * args["n_layers"]
+        self.mu_size = self.data.nineq
+        self.lamb_size = self.data.neq
 
         if args["device"] == "mps":
             self.DTYPE = torch.float32
@@ -56,66 +56,8 @@ class DualNetEndToEnd(nn.Module):
             self.DTYPE = torch.float64
             self.DEVICE = torch.device("cpu")
 
-        #! Only predict lambda, we infer mu from it.
-        self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim).to(self.DTYPE).to(self.DEVICE)
-
-        # Set dual variables to 0 at the first iteration
-        # nn.init.zeros_(self.feed_forward.net[-1].weight)  # Initialize output layer weights to 0
-        # nn.init.zeros_(self.feed_forward.net[-1].bias)    # Initialize output layer biases to 0
-    
-    def complete_duals(self, lamb):
-        # first num_g outputs are the equality constraints added in benders compact form
-        # if self.data.args["benders_compact"]:
-            #TODO
-            # pass
-            # lamb_D_nt = lamb[:, self.data.num_g:]
-            # eq_cm_D_nt = self.data.eq_cm[:, self.data.num_g:, self.data.num_g:]
-            # obj_coeff = self.data.obj_coeff[self.data.num_g:]
-        # else:
-        eq_cm_D_nt = self.data.eq_cm
-        lamb_D_nt = lamb
-        obj_coeff = self.data.obj_coeff
-
-        # mu = obj_coeff - torch.matmul(eq_cm_D_nt.transpose(1, 2), lamb_D_nt.unsqueeze(-1)).squeeze(-1)
-        mu = obj_coeff - torch.matmul(lamb_D_nt, eq_cm_D_nt)
-
-        # Compute lower and upper bound multipliers
-        mu_lb = torch.relu(mu)   # Lower bound multipliers |mu|^+
-        mu_ub = torch.relu(-mu)  # Upper bound multipliers |mu|^-
-
-        # Split into groups, following the exact structure of mu
-        p_g_lb = mu_lb[:, :self.data.num_g]  # Lower bounds for p_g
-        p_g_ub = mu_ub[:, :self.data.num_g]  # Upper bounds for p_g
-
-        f_l_lb = mu_lb[:, self.data.num_g:self.data.num_g + self.data.num_l]  # Lower bounds for f_l
-        f_l_ub = mu_ub[:, self.data.num_g:self.data.num_g + self.data.num_l]  # Upper bounds for f_l
-
-        md_n_lb = mu_lb[:, self.data.num_g + self.data.num_l:]  # Lower bounds for md_n
-        md_n_ub = mu_ub[:, self.data.num_g + self.data.num_l:]  # Upper bounds for md_n
-
-        # Concatenate while maintaining order
-        out_mu = torch.cat([
-            p_g_lb, p_g_ub,  # Lower and Upper bounds for p_g
-            f_l_lb, f_l_ub,  # Lower and Upper bounds for f_l
-            md_n_lb, md_n_ub  # Lower and Upper bounds for md_n
-        ], dim=1)
-
-        return out_mu
-        
-        
-    def forward(self, x):
-        out_lamb = self.feed_forward(x)
-        out_mu = self.complete_duals(out_lamb)
-
-        return out_mu, out_lamb
-
-class DualNet(nn.Module):
-    def __init__(self, args, data):
-        super().__init__()
-        self.data = data
-        self.hidden_sizes = [int(args["hidden_size_factor"]*data.xdim)] * args["n_layers"]
-        self.mu_size = self.data.nineq
-        self.lamb_size = self.data.neq
+        torch.set_default_dtype(self.DTYPE)
+        torch.set_default_device(self.DEVICE)
 
         # Create the list of layer sizes
         layer_sizes = [data.xdim] + self.hidden_sizes
@@ -141,9 +83,6 @@ class DualNet(nn.Module):
     
     def forward(self, x, *args):
         out = self.net(x)
-        #! ReLU to enforce nonnegativity in mu. Test with it.
-        #! Does this work with zero initialization?
-        # out_mu = torch.relu(out[:, :self.mu_size])
         out_mu = out[:, :self.mu_size]
         out_lamb = out[:, self.mu_size:]
         return out_mu, out_lamb
@@ -178,9 +117,8 @@ class DualNetTwoOutputLayers(nn.Module):
         out_lamb = self.out_layer_lamb(out)
         return out_mu, out_lamb
 
-
 class FeedForwardNet(nn.Module):
-    def __init__(self, args, input_dim, hidden_sizes, output_dim):
+    def __init__(self, args, input_dim, hidden_sizes, output_dim, layernorm=None):
         """_summary_
 
         Args:
@@ -207,18 +145,18 @@ class FeedForwardNet(nn.Module):
         layer_sizes = [self.input_dim] + self.hidden_sizes + [self.output_dim]
         layers = []
         
-        if args["layernorm"]:
-            layers.append(nn.LayerNorm(input_dim)) #! This is necessary to prevent gradient saturation in the sigmoids.
+        if layernorm is None:
+            if args["layernorm"]:
+                layers.append(nn.LayerNorm(input_dim)) #! This is necessary to prevent gradient saturation in the sigmoids.
+        elif layernorm is True:
+            layers.append(nn.LayerNorm(input_dim))
 
         # Create layers dynamically based on the provided hidden_sizes
         for idx, (in_size, out_size) in enumerate(zip(layer_sizes[:-1], layer_sizes[1:])):
-            # layers.append(nn.LayerNorm(in_size)) #! LayerNorm
             layers.append(nn.Linear(in_size, out_size))
             # Add ReLU only if it is not the last layer
             if idx < len(layer_sizes) - 2:  # The last layer does not need ReLU
                 layers.append(nn.ReLU())
-                # layers.append(nn.LayerNorm(out_size))
-                # layers.append(nn.LeakyReLU())
         
         # Initialize all layers
         for layer in layers:
@@ -230,21 +168,6 @@ class FeedForwardNet(nn.Module):
     def forward(self, x):
         x_out = self.net(x)
         return x_out
-
-    # def forward(self, x):
-    #     x_out = x
-    #     # Iterate through layers manually for debugging
-    #     for layer in self.net:
-    #         x_out = layer(x_out)
-            
-    #         # If it's not a ReLU layer, check if any activations are negative
-    #         if not isinstance(layer, nn.ReLU):
-    #             # Check if any activation is < 0
-    #             if torch.any(x_out < 0):
-    #                 # print(f"Negative activations found: {x_out[x_out < 0]}")
-    #                 print(f"Mean of activations: {x_out.mean().item()}, Min of activations: {x_out.min().item()}, Max of activations: {x_out.max().item()}")
-        
-    #     return x_out
 
 
 class BoundRepairLayer(nn.Module):
@@ -266,8 +189,7 @@ class BoundRepairLayer(nn.Module):
 
         repaired = lb + (ub - lb) * scaled
 
-        if False:
-            # Attach hooks to inspect gradients
+        if False: #! Set to True to attach hooks to inspect gradients
             def print_grad(name):
                 return lambda grad: print(f"Gradient for {name}: {grad.norm():.4e}")
             x.register_hook(print_grad("x"))
@@ -275,10 +197,6 @@ class BoundRepairLayer(nn.Module):
             repaired.register_hook(print_grad("repaired output"))
 
         return repaired
-        # return torch.sigmoid(k*x)
-        # return torch.clamp(x, lb, ub)
-        # return (lb + (ub - lb)/2 * (torch.tanh(x) + 1))
-
 class EstimateSlackLayer(nn.Module):
     def __init__(self, node_to_gen_mask, lineflow_mask):
         super().__init__()
@@ -296,81 +214,12 @@ class EstimateSlackLayer(nn.Module):
         """
         combined_flow = torch.matmul(p_gt, self.node_to_gen_mask.T) + \
                         torch.matmul(f_lt, self.lineflow_mask.T)
-        
-        #! If there are no lineflows, this is the same:
-        # combined_flow = p_gt.sum(dim=1, keepdim=True)
+    
         md_nt = D_nt - combined_flow
-
-        # md_nt = D_nt - p_gt
 
         return md_nt
 
 class PrimalNetEndToEnd(nn.Module):
-        def __init__(self, args, data):
-            super().__init__()
-            self.data = data
-            self.hidden_sizes = [int(args["hidden_size_factor"]*data.xdim)] * args["n_layers"]
-            self.args = args
-
-            if self.args["device"] == "mps":
-                self.DTYPE = torch.float32
-                self.DEVICE = torch.device("mps")
-            else:
-                self.DTYPE = torch.float64
-                self.DEVICE = torch.device("cpu")
-
-            torch.set_default_dtype(self.DTYPE)
-            torch.set_default_device(self.DEVICE)
-
-            # TODO: Implement compact benders form.
-            # if self.data.args["benders_compact"]:
-                # self.out_dim = data.num_g + data.n_prod_vars + data.n_line_vars
-            # else:
-            self.out_dim = data.n_prod_vars + data.n_line_vars
-
-            self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim).to(self.DTYPE).to(self.DEVICE)
-            
-
-            # ! Test with init zeros.
-            # nn.init.zeros_(self.feed_forward.net[-1].weight)  # Initialize output layer weights to 0
-            # nn.init.zeros_(self.feed_forward.net[-1].bias)    # Initialize output layer biases to 0
-
-            self.bound_repair_layer = BoundRepairLayer()
-            # self.ramping_repair_layer = RampingRepairLayer()
-
-            self.estimate_slack_layer = EstimateSlackLayer(data.node_to_gen_mask.to(self.DEVICE), data.lineflow_mask.to(self.DEVICE))
-        
-        def forward(self, x, total_demands=None):
-            eq_rhs, ineq_rhs = self.data.split_X(x)
-            
-            x_out = self.feed_forward(x)
-            # [B, G, T], [B, L, T]
-            ui_g, p_gt, f_lt = self.data.split_dec_vars_from_Y_raw(x_out)
-
-            # [B, bounds, T]
-            p_gt_lb, p_gt_ub, f_lt_lb, f_lt_ub, md_nt_lb, md_nt_ub = self.data.split_ineq_constraints(ineq_rhs)
-
-            if self.args["repair_bounds"]:
-                p_gt = self.bound_repair_layer(p_gt, p_gt_lb, p_gt_ub)
-                #! Easy repair if we only have a single node and a single generator.
-                # p_gt_bound_repaired = self.bound_repair_layer(p_gt, p_gt_lb, torch.min(p_gt_ub, eq_rhs))
-
-                # Lineflow lower bound is negative.
-                f_lt = self.bound_repair_layer(f_lt, -f_lt_lb, f_lt_ub)
-
-
-            UI_g, D_nt = self.data.split_eq_constraints(eq_rhs)
-            md_nt = self.estimate_slack_layer(p_gt, f_lt, D_nt)
-
-            y = torch.cat([p_gt, f_lt, md_nt], dim=1)
-            # y = torch.cat([md_nt, f_lt, p_gt], dim=1)
-
-            if not self.training and (total_demands != None):
-                return y * total_demands
-            else:
-                return y
-
-class PrimalNetEndToEnd2(nn.Module):
     def __init__(self, args, data):
         super().__init__()
         self.data = data
@@ -410,11 +259,6 @@ class PrimalNetEndToEnd2(nn.Module):
             self.out_dim = data.n_prod_vars + data.n_line_vars + data.n_md_vars
 
         self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim).to(self.DTYPE).to(self.DEVICE)
-        
-
-        # ! Test with init zeros.
-        # nn.init.zeros_(self.feed_forward.net[-1].weight)  # Initialize output layer weights to 0
-        # nn.init.zeros_(self.feed_forward.net[-1].bias)    # Initialize output layer biases to 0
         
         if self.args["repair_bounds"]:
             self.bound_repair_layer = BoundRepairLayer()
@@ -483,115 +327,143 @@ class PrimalNetEndToEnd2(nn.Module):
             return y * total_demands
         else:
             return y
-        
-        
-class ImplicitLayer(nn.Module):
-    def __init__(self, args, data):
+
+class DualNetEndToEnd(nn.Module):
+    def __init__(self, args, data, hidden_size_factor=5.0, n_layers=4):
         super().__init__()
         self.data = data
-        self.lineflow_mask = data.lineflow_mask
-        self.node_to_gen_mask = data.node_to_gen_mask
+        self.hidden_sizes = [int(hidden_size_factor*data.xdim)] * n_layers
         self.args = args
+        self.ED_args = args["ED_args"]
 
-        self.gen_cost_vec = data.obj_coeff[:data.num_g]
-        self.penalty_unmet_demand = data.pVOLL
+        if self.ED_args["benders_compact"]:
+            self.out_dim = data.num_g + data.neq
+        else:
+            self.out_dim = data.neq
 
-        if self.args["device"] == "mps":
+        if args["device"] == "mps":
             self.DTYPE = torch.float32
             self.DEVICE = torch.device("mps")
         else:
             self.DTYPE = torch.float64
             self.DEVICE = torch.device("cpu")
+
+        #! Only predict lambda, we infer mu from it.
+        self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim, layernorm=True).to(self.DTYPE).to(self.DEVICE)
     
-    def greedy_differentiable_allocation(self, max_gen, demand):
-        #! Assumes that the generators are sorted increasing by cost within node.
+    def complete_duals(self, lamb):
+        eq_cm_D_nt = self.data.eq_cm
+        lamb_D_nt = lamb
+        obj_coeff = self.data.obj_coeff
+
+        mu = obj_coeff + torch.matmul(lamb_D_nt, eq_cm_D_nt)
+
+        # Compute lower and upper bound multipliers
+        mu_lb = torch.relu(mu)   # Lower bound multipliers |mu|^+
+        mu_ub = torch.relu(-mu)  # Upper bound multipliers |mu|^-
+
+        # Split into groups, following the exact structure of mu
+        p_g_lb = mu_lb[:, :self.data.num_g]  # Lower bounds for p_g
+        p_g_ub = mu_ub[:, :self.data.num_g]  # Upper bounds for p_g
+
+        f_l_lb = mu_lb[:, self.data.num_g:self.data.num_g + self.data.num_l]  # Lower bounds for f_l
+        f_l_ub = mu_ub[:, self.data.num_g:self.data.num_g + self.data.num_l]  # Upper bounds for f_l
+
+        md_n_lb = mu_lb[:, self.data.num_g + self.data.num_l:]  # Lower bounds for md_n
+        md_n_ub = mu_ub[:, self.data.num_g + self.data.num_l:]  # Upper bounds for md_n
+
+        # Concatenate while maintaining order
+        out_mu = torch.cat([
+            p_g_lb, p_g_ub,  # Lower and Upper bounds for p_g
+            f_l_lb, f_l_ub,  # Lower and Upper bounds for f_l
+            md_n_lb, md_n_ub  # Lower and Upper bounds for md_n
+        ], dim=1)
+
+        return out_mu
         
-        B, G = max_gen.shape
-        N = demand.shape[1]
-        device = demand.device
-
-        # [B, N, G]: repeat demand per generator
-        demand_per_gen = torch.einsum("bn,ng->bng", demand, self.node_to_gen_mask)
-
-        max_gen_per_node = self.node_to_gen_mask.unsqueeze(0) * max_gen.unsqueeze(1)  # [B, N, G]
-
-        cum_cap = torch.cumsum(max_gen_per_node, dim=2)                     # [B, N, G]
-        prev_cum = torch.cat([torch.zeros(B, N, 1, device=device), cum_cap[:, :, :-1]], dim=2)
-
-        alloc = torch.clamp(demand_per_gen - prev_cum, min=0.0)
-        alloc = torch.minimum(alloc, max_gen_per_node)
-
-        # Collapse node dimension → [B, G] (summing contributions from all N to each generator)
-        p_gt = alloc.sum(dim=1)
-
-        return p_gt
-
-    def forward(self, f_lt_bound_repaired, D_nt, p_gt_ub):
-        net_flow = torch.matmul(f_lt_bound_repaired, self.lineflow_mask.T)  # [B, N]
-        updated_demand = D_nt - net_flow                                    # [B, N]
-
-        p_gt = self.greedy_differentiable_allocation(p_gt_ub, updated_demand)  # [B, G]
-
-        # Project back generator output to nodes: [B, N] = [B, G] @ [G, N]
-        md_nt = updated_demand - torch.matmul(p_gt, self.node_to_gen_mask.T)
-
-        return p_gt, md_nt
-
-class PrimalNetImplicit(nn.Module):
-    """Implementation of a primal net with an implicit layer. The primal net only predicts the lineflows. The optimal generator production is then derived from the lineflows using an implicit layer.
-
-    Args:
-        nn (_type_): _description_
-    """
-    def __init__(self, args, data):
+        
+    def forward(self, x):
+        out_lamb = self.feed_forward(x)
+        out_mu = self.complete_duals(out_lamb)
+        # print(out_lamb)
+        return out_mu, out_lamb
+    
+class DualClassificationNetEndToEnd(nn.Module):
+    def __init__(self, args, data, hidden_size_factor=5.0, n_layers=4):
         super().__init__()
         self.data = data
-        self.hidden_sizes = [int(args["hidden_size_factor"]*data.xdim)] * args["n_layers"]
+        self.hidden_sizes = [int(hidden_size_factor*data.xdim)] * n_layers
         self.args = args
+        self.ED_args = args["ED_args"]
 
-        if self.args["device"] == "mps":
+        # Objective coefficients contain all costs for all generators and unmet demand.
+        self.classes = -1 * torch.concat([self.data.cost_vec.unique(), torch.tensor([self.data.pVOLL])])
+        self.n_classes = self.classes.numel()
+        self.n_dual_vars = data.neq
+
+        #! For each dual variable, We now predict probabilities for each class
+        self.out_dim = self.n_classes * self.n_dual_vars
+
+        if args["device"] == "mps":
             self.DTYPE = torch.float32
             self.DEVICE = torch.device("mps")
         else:
             self.DTYPE = torch.float64
             self.DEVICE = torch.device("cpu")
 
-        #! Out dim is only the lineflows
-        self.out_dim = data.n_line_vars
+        #! Only predict lambda, we infer mu from it.
+        #! Softmax requires layer norm.
+        self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim, layernorm=True).to(self.DTYPE).to(self.DEVICE)
+    
+    def complete_duals(self, lamb):
+        eq_cm_D_nt = self.data.eq_cm
+        lamb_D_nt = lamb
+        obj_coeff = self.data.obj_coeff
 
-        self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim).to(self.DTYPE).to(self.DEVICE)
+        mu = obj_coeff + torch.matmul(lamb_D_nt, eq_cm_D_nt)
 
-        self.bound_repair_layer = BoundRepairLayer()
-        # self.ramping_repair_layer = RampingRepairLayer()
-        self.implicit_layer = ImplicitLayer(self.args, self.data)
+        # Compute lower and upper bound multipliers
+        mu_lb = torch.relu(mu)   # Lower bound multipliers |mu|^+
+        mu_ub = torch.relu(-mu)  # Upper bound multipliers |mu|^-
 
-        self.estimate_slack_layer = EstimateSlackLayer(data.node_to_gen_mask.to(self.DEVICE), data.lineflow_mask.to(self.DEVICE))
+        # Split into groups, following the exact structure of mu
+        p_g_lb = mu_lb[:, :self.data.num_g]  # Lower bounds for p_g
+        p_g_ub = mu_ub[:, :self.data.num_g]  # Upper bounds for p_g
 
-    def forward(self, x):
-        eq_rhs, ineq_rhs = self.data.split_X(x)
+        f_l_lb = mu_lb[:, self.data.num_g:self.data.num_g + self.data.num_l]  # Lower bounds for f_l
+        f_l_ub = mu_ub[:, self.data.num_g:self.data.num_g + self.data.num_l]  # Upper bounds for f_l
+
+        md_n_lb = mu_lb[:, self.data.num_g + self.data.num_l:]  # Lower bounds for md_n
+        md_n_ub = mu_ub[:, self.data.num_g + self.data.num_l:]  # Upper bounds for md_n
+
+        # Concatenate while maintaining order
+        out_mu = torch.cat([
+            p_g_lb, p_g_ub,  # Lower and Upper bounds for p_g
+            f_l_lb, f_l_ub,  # Lower and Upper bounds for f_l
+            md_n_lb, md_n_ub  # Lower and Upper bounds for md_n
+        ], dim=1)
+
+        return out_mu
         
-        # Output from the feed forward net is the lineflows.
-        f_lt = self.feed_forward(x)
+        
+    def forward(self, x):
+        out_lamb_raw_probas = self.feed_forward(x) # [B, n_var*n_classes]
+        T = 1
+        out_lamb_raw_probas = out_lamb_raw_probas.view(-1, self.n_dual_vars, self.n_classes) # [B, n_var, n_classes]
 
-        p_gt_lb, p_gt_ub, f_lt_lb, f_lt_ub, md_nt_lb, md_nt_ub = self.data.split_ineq_constraints(ineq_rhs)
+        if self.training:
+            out_lamb_probas = torch.softmax(out_lamb_raw_probas, dim=-1)
 
-        # p_gt_bound_repaired = self.bound_repair_layer(p_gt, p_gt_lb, p_gt_ub)
-        #! Easy repair if we only have a single node and a single generator.
-        # p_gt_bound_repaired = self.bound_repair_layer(p_gt, p_gt_lb, torch.min(p_gt_ub, eq_rhs))
+            out_lamb = torch.sum(out_lamb_probas * self.classes, dim=-1)
+            out_mu = self.complete_duals(out_lamb)
 
-        # Repair the lineflows. Note that we need to negate the lower bound, since it is positive in the RHS, but should be negative.
-        f_lt_bound_repaired = self.bound_repair_layer(f_lt, -f_lt_lb, f_lt_ub)
+            return out_mu, out_lamb
 
-
-        p_gt, md_nt = self.implicit_layer(f_lt_bound_repaired, eq_rhs, p_gt_ub)
-
-        # eq_rhs only contains the demand.
-        # md_nt = self.estimate_slack_layer(p_gt, f_lt_bound_repaired, eq_rhs)
-
-        y = torch.cat([p_gt, f_lt_bound_repaired, md_nt], dim=1)
-
-        return y
-         
+        else:
+            predicted_class = out_lamb_raw_probas.argmax(dim=-1)
+            out_lamb = self.classes[predicted_class]
+            out_mu = self.complete_duals(out_lamb)
+            return out_mu, out_lamb
          
 def load(args, data, save_dir):
     primal_net = PrimalNetEndToEnd(args, data=data)

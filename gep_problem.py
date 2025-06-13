@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 class GEPProblemSet():
 
-    def __init__(self, args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, target_path):
+    def __init__(self, args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap):
         self.DTYPE = torch.float64
         self.DEVICE = torch.device("cpu")
         torch.set_default_dtype(self.DTYPE)
@@ -14,9 +14,9 @@ class GEPProblemSet():
         # Args:
         self.args = args
         self.sample_duration = args["sample_duration"]
-        self.train = args["train"]
-        self.valid = args["valid"]
-        self.test = args["test"]
+        # self.train = args["train"]
+        # self.valid = args["valid"]
+        # self.test = args["test"]
 
         # Input Sets
         self.T = T
@@ -62,7 +62,6 @@ class GEPProblemSet():
         self.nineq = self.n_ineq_per_t * self.sample_duration + self.n_inv_vars #Q Maaike: with investment var right?
         self.ydim = self.n_inv_vars + self.n_prod_vars + self.n_line_vars + self.n_md_vars
 
-        self._opt_targets = self.load_targets(target_path)
 
         # Masks for node balance!
         # Initialize mask
@@ -96,7 +95,6 @@ class GEPProblemSet():
         self.xdim = self.X.shape[1]
 
         # Split x into training, val, test sets.
-        self._split_X_in_sets(self.train, self.valid, self.test)
     
     # Split the data
     @property
@@ -108,10 +106,6 @@ class GEPProblemSet():
     
     @property
     def opt_targets(self): return self._opt_targets
-
-    def load_targets(self, target_path):
-        with open(target_path, 'rb') as file:
-            return pickle.load(file)
     
     def split_ineq_constraints(self, ineq):
         # TODO: Fix for inclusion of 3.1k.
@@ -386,92 +380,3 @@ class GEPProblemSet():
             eq_rhs += [self.pDemand[(n, t)] for n in self.N]
 
         return eq_cm, torch.tensor(eq_rhs)
-
-    def _split_X_in_sets(self, train=0.8, valid=0.1, test=0.1):
-        # Ensure the split ratios sum to 1
-        assert train + valid + test == 1.0
-
-        # Total number of samples
-        B = self.X.size(0)
-        indices = torch.arange(B)
-
-        # Compute sizes for each set
-        train_size = int(train * B)
-        valid_size = int(valid * B)
-
-        # Split the indices
-        self._train_indices = indices[:train_size]
-        self._valid_indices = indices[train_size:train_size+valid_size]
-        self._test_indices = indices[train_size+valid_size:]
-
-        # Convert time_ranges to a tensor or use list comprehension
-        time_ranges_tensor = torch.tensor(self.time_ranges)
-
-        # Split time ranges
-        self.train_time_ranges = time_ranges_tensor[self.train_indices].tolist()
-        self.val_time_ranges = time_ranges_tensor[self.valid_indices].tolist()
-        self.test_time_ranges = time_ranges_tensor[self.test_indices].tolist()
-
-        print(f"Size of train set: {train_size}")
-        print(f"Size of val set: {valid_size}")
-        print(f"Size of test set: {B - train_size - valid_size}")
-
-if __name__ == "__main__":
-    import pickle
-    import time
-    import json
-
-    from gep_config_parser import *
-
-    from create_gep_dataset import prep_data
-
-    CONFIG_FILE_NAME        = "config.toml"
-    VISUALIZATION_FILE_NAME = "visualization.toml"
-
-    ## Step 1: parse the input data
-    print("Parsing the config file")
-
-    data = parse_config(CONFIG_FILE_NAME)
-    experiment = data["experiment"]
-    outputs_config = data["outputs_config"]
-
-    with open("config.json", "r") as file:
-        args = json.load(file)
-    
-    print(args)
-
-    # Train the model:
-    for i, experiment_instance in enumerate(experiment["experiments"]):
-        # Setup output dataframe
-        df_res = pd.DataFrame(columns=["setup_time", "presolve_time", "barrier_time", "crossover_time", "restore_time", "objective_value"])
-
-        for j in range(experiment["repeats"]):
-            # Run one experiment for j repeats
-            run_name = f"refactored_train:{args['train']}_rho:{args['rho']}_rhomax:{args['rho_max']}_alpha:{args['alpha']}_L:{args['alpha']}"
-            save_dir = os.path.join('outputs', 'PDL',
-                run_name + "-" + str(time.time()).replace('.', '-'))
-            if not os.path.exists(save_dir):
-                os.makedirs(save_dir)
-            with open(os.path.join(save_dir, 'args.dict'), 'wb') as f:
-                pickle.dump(args, f)
-            
-            # Prep proble data:
-            data = prep_data(experiment_instance, N=args["N"], G=args["G"], L=args["L"], train=args["train"], valid=args["valid"], test=args["test"], scale=args["scale_problem"], sample_duration=args["sample_duration"], constant_gen_inv=args["operational"])
-    
-    # Create figure and axes
-    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
-
-    # Plot each matrix as a heatmap
-    matrices = [data.eq_cm[0], data.eq_rhs[0].unsqueeze(-1), data.ineq_cm[0], data.ineq_rhs[0].unsqueeze(-1), data.obj_coeff.unsqueeze(-1)]
-    titles = ["eq_cm", "eq_rhs", "ineq_cm", "ineq_rhs", "obj_coeff"]
-
-    for ax, matrix, title in zip(axes, matrices, titles):
-        im = ax.imshow(matrix, cmap='viridis', aspect='auto')
-        ax.set_title(title)
-        ax.set_xlabel("Columns")
-        ax.set_ylabel("Rows")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)  # Add colorbar
-
-    # Adjust layout and show plot
-    plt.tight_layout()
-    plt.show()

@@ -26,14 +26,14 @@ def scale_dict(data_dict, scale_factor):
     return {key: value * scale_factor for key, value in data_dict.items()}
 
 
-def create_gep_ed_dataset(args, inputs, problem_type, save_path):
+def create_gep_ed_dataset(args, problem_args, inputs, problem_type, save_path):
     print("Wrangling the input data")
 
     # Extract sets
     T = inputs["times"] # [1, 2, 3, ... 8760] ---> 8760
-    N = args["N"]
-    G = args["G"]
-    L = args["L"]
+    N = problem_args["N"]
+    G = problem_args["G"]
+    L = problem_args["L"]
 
     if not (N or G or L):
         G = inputs["generators"] # [('Country1', 'EnergySource1'), ...] ---> 107
@@ -63,7 +63,7 @@ def create_gep_ed_dataset(args, inputs, problem_type, save_path):
 
     # WOP
     # Scale inversely proportional to times (T)
-    pWeight = inputs["representative_period_weight"] / (args["sample_duration"] / 8760)
+    pWeight = inputs["representative_period_weight"] / (problem_args["sample_duration"] / 8760)
 
     pRamping = inputs["ramping_value"]
 
@@ -99,17 +99,17 @@ def create_gep_ed_dataset(args, inputs, problem_type, save_path):
         value="ImpCap_MW"
     )
 
-    if args["scale_problem"]:
-        pDemand = scale_dict(pDemand, SCALE_FACTORS["pDemand"])
-        pGenAva = scale_dict(pGenAva, SCALE_FACTORS["pGenAva"])
-        pVOLL *= SCALE_FACTORS["pVOLL"]
-        pWeight *= SCALE_FACTORS["pWeight"]
-        pRamping *= SCALE_FACTORS["pRamping"]
-        pInvCost = scale_dict(pInvCost, SCALE_FACTORS["pInvCost"])
-        pVarCost = scale_dict(pVarCost, SCALE_FACTORS["pVarCost"])
-        pUnitCap = scale_dict(pUnitCap, SCALE_FACTORS["pUnitCap"])
-        pExpCap = scale_dict(pExpCap, SCALE_FACTORS["pExpCap"])
-        pImpCap = scale_dict(pImpCap, SCALE_FACTORS["pImpCap"])
+    # if args["scale_problem"]: #! For scaling the problem inputs.
+    #     pDemand = scale_dict(pDemand, SCALE_FACTORS["pDemand"])
+    #     pGenAva = scale_dict(pGenAva, SCALE_FACTORS["pGenAva"])
+    #     pVOLL *= SCALE_FACTORS["pVOLL"]
+    #     pWeight *= SCALE_FACTORS["pWeight"]
+    #     pRamping *= SCALE_FACTORS["pRamping"]
+    #     pInvCost = scale_dict(pInvCost, SCALE_FACTORS["pInvCost"])
+    #     pVarCost = scale_dict(pVarCost, SCALE_FACTORS["pVarCost"])
+    #     pUnitCap = scale_dict(pUnitCap, SCALE_FACTORS["pUnitCap"])
+    #     pExpCap = scale_dict(pExpCap, SCALE_FACTORS["pExpCap"])
+    #     pImpCap = scale_dict(pImpCap, SCALE_FACTORS["pImpCap"])
 
 
     # We need to sort the dictionaries for changing to tensors!
@@ -125,58 +125,10 @@ def create_gep_ed_dataset(args, inputs, problem_type, save_path):
     if problem_type == "ED":
         data = GEPOperationalProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
     elif problem_type == "GEP":
-        data = GEPProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
+        data = GEPProblemSet(problem_args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
 
     with open(save_path, 'wb') as file:
         pickle.dump(data, file)
 
     return data
-
-# if __name__ == "__main__":
-#     import json
-
-#     ## Step 1: parse the input data
-#     print("Parsing the config file")
-
-#     data = parse_config(CONFIG_FILE_NAME)
-#     experiment = data["experiment"]
-#     outputs_config = data["outputs_config"]
-
-#     with open("config.json", "r") as file:
-#         args = json.load(file)
-    
-#     print(args)
-
-#     # Train the model:
-#     for i, experiment_instance in enumerate(experiment["experiments"]):
-#         # Setup output dataframe
-#         df_res = pd.DataFrame(columns=["setup_time", "presolve_time", "barrier_time", "crossover_time", "restore_time", "objective_value"])
-
-#         for j in range(experiment["repeats"]):
-#             # Run one experiment for j repeats
-#             run_name = f"refactored_train:{args['train']}_rho:{args['rho']}_rhomax:{args['rho_max']}_alpha:{args['alpha']}_L:{args['alpha']}"
-#             save_dir = os.path.join('outputs', 'PDL',
-#                 run_name + "-" + str(time.time()).replace('.', '-'))
-#             if not os.path.exists(save_dir):
-#                 os.makedirs(save_dir)
-#             with open(os.path.join(save_dir, 'args.dict'), 'wb') as f:
-#                 pickle.dump(args, f)
-
-#             target_path = f"outputs/Gurobi/Operational={args['operational']}_T={args['sample_duration']}_Scale={args['scale_problem']}_{args['G']}_{args['L']}"
-#             data_save_path = "operational_data/data.pkl"
-#             # Prep problem data:
-#             if not os.path.exists(data_save_path):
-#                 data = create_gep_ed_dataset(args=args, inputs=experiment_instance, target_path=target_path, operational=args['operational'])
-#                 data.save_data(data_save_path)
-#             else:
-#                 with open(data_save_path, 'rb') as file:
-#                     data = pickle.load(file)
-
-#             # Run PDL
-#             trainer = PrimalDualTrainer(data, args, save_dir)
-#             primal_net, dual_net, stats = trainer.train_PDL()
-
-#             # primal_net, dual_net = load(data, save_dir)
-#             data.plot_balance(primal_net, dual_net)
-#             data.plot_decision_variable_diffs(primal_net, dual_net)
 

@@ -6,6 +6,7 @@ class TensorBoardLogger():
         self.writer = SummaryWriter(log_dir=save_dir)
         self.opt_targets = opt_targets
         self.args = args
+        self.data = data
         self.problem_type = args["problem_type"]
         self.is_qp = self.problem_type == "QP"
         self.is_qp_simple = self.problem_type == "QP" and args["QP_args"]["type"] == "simple"
@@ -45,9 +46,6 @@ class TensorBoardLogger():
                 self.Y_target_train = data.trainY
                 self.Y_target_valid = data.validY
 
-    def close(self):
-        self.writer.close()
-
     def log_primal_loss(self, loss, obj, lagrange_eq, lagrange_ineq, penalty, step):
 
         self.writer.add_scalar(f"Train_loss/primal_loss", loss, step)
@@ -56,8 +54,14 @@ class TensorBoardLogger():
         self.writer.add_scalar(f"Train_loss_components/primal_lagrange_ineq", lagrange_ineq, step)
         self.writer.add_scalar(f"Train_loss_components/primal_penalty", penalty, step)
     
-    def log_dual_loss(self, loss, step):
+    def log_dual_loss(self, loss, step, obj, lagrange_eq, lagrange_ineq, penalty):
         self.writer.add_scalar(f"Train_loss/dual_loss", loss, step)
+        self.writer.add_scalar(f"dual_loss_components/obj", obj, step)
+        self.writer.add_scalar(f"dual_loss_components/lagrange_eq", lagrange_eq, step)
+        self.writer.add_scalar(f"dual_loss_components/lagrange_ineq", lagrange_ineq, step)
+        self.writer.add_scalar(f"dual_loss_components/dual_penalty", penalty, step)
+
+
 
     def log_train(self, data, primal_net, dual_net, rho, step):
         with torch.no_grad():
@@ -65,10 +69,8 @@ class TensorBoardLogger():
             dual_net.eval()
             Y = primal_net(self.X_train, self.scale_factors_train)
             mu, lamb = dual_net(self.X_train)
-            obj = data.obj_fn(self.X_train, Y)
-            
 
-            # print(Y[0, 5*14:5*15].tolist())
+            obj = data.obj_fn(self.X_train, Y)
 
             ineq_resid = data.ineq_resid(self.X_train, Y)
             ineq_dist = data.ineq_dist(self.X_train, Y)
@@ -87,12 +89,11 @@ class TensorBoardLogger():
                 optimality_gap = (obj - obj_target)/obj_target
                 self.writer.add_scalar(f"Train_obj/obj_optimality_gap", optimality_gap.mean(), step)
             
-                # print((dual_obj < 0).sum()/len(dual_obj))
             # Obj funcs
             self.writer.add_scalar(f"Train_obj/obj", obj.mean(), step)
             
 
-            # Neural network outputs and targets
+            #! Neural network outputs and targets
             # self.writer.add_scalar(f"Train_outputs/Y", Y.mean(), step)
             # self.writer.add_scalar(f"Train_outputs/mu", mu.mean(), step)
             # self.writer.add_scalar(f"Train_outputs/lamb", lamb.mean(), step)
@@ -108,7 +109,7 @@ class TensorBoardLogger():
             #     self.writer.add_scalar(f"Train_outputs/mu_diff", mu_diff.mean(), step)
             #     self.writer.add_scalar(f"Train_outputs/lamb_diff", lamb_diff.mean(), step)
 
-            # Constraint violations
+            #! Constraint violations
             # self.writer.add_scalar(f"Train_constraints/eq_resid", eq_resid.mean(), step)
             # self.writer.add_scalar(f"Train_constraints/ineq_resid", ineq_resid.mean(), step)
             # self.writer.add_scalar(f"Train_constraints/ineq_mean", ineq_dist.mean(), step)

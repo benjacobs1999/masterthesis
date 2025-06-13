@@ -1,6 +1,9 @@
+#! Based on https://github.com/locuslab/DC3
+
 import torch
 import numpy as np
 import osqp
+import cyipopt as ipopt
 from scipy.sparse import csc_matrix
 
 import time
@@ -45,6 +48,8 @@ class SimpleProblem(ABC):
         self._nineq = None
         self._xdim = None
 
+        self._mu = None
+        self._lamb = None
 
     ##### ABSTRACT METHODS #####
 
@@ -243,12 +248,52 @@ class SimpleProblem(ABC):
     @property
     def testY(self):
         return self.Y[int(self.num * (self.train_frac + self.valid_frac)) :]
+    
+    @property
+    def mu(self):
+        return self._mu
+    
+    @property
+    def lamb(self):
+        return self._lamb
+
+    @property
+    def train_mu(self):
+        return self._mu[: int(self.num * self.train_frac)]
+
+    @property
+    def valid_mu(self):
+        return self._mu[
+            int(self.num * self.train_frac) : int(
+                self.num * (self.train_frac + self.valid_frac)
+            )
+        ]
+
+    @property
+    def test_mu(self):
+        return self.mu[int(self.num * (self.train_frac + self.valid_frac)) :]
+    
+    @property
+    def train_lamb(self):
+        return self.lamb[: int(self.num * self.train_frac)]
+
+    @property
+    def valid_lamb(self):
+        return self.lamb[
+            int(self.num * self.train_frac) : int(
+                self.num * (self.train_frac + self.valid_frac)
+            )
+        ]
+    
+    @property
+    def test_lamb(self):
+        return self.lamb[int(self.num * (self.train_frac + self.valid_frac)) :]
 
     @property
     def device(self):
         return self._device
 
-    def obj_fn(self, Y):
+    def obj_fn(self, X, Y):
         return (0.5 * (Y @ self.Q) * Y +  self.p * Y).sum(dim=1)
 
     def ineq_dist(self, X, Y):
@@ -300,7 +345,6 @@ class OriginalQPProblem(SimpleProblem):
 
         self.A_transpose = self._A.T
         self.G_transpose = self._G.T
-
 
     def eq_resid(self, X, Y):
         # Here, X is the RHS of the equality constraints
@@ -385,14 +429,14 @@ class OriginalQPProblem(SimpleProblem):
         # Compute final dual objective value
         return quad_value + lin_term_lambda + lin_term_mu
 
-    def dual_eq_resid(self, X, mu, lamb):
-        return 0
+    def dual_eq_resid(self, mu, lamb):
+        return torch.tensor(0.0)
 
-    def dual_ineq_resid(self, X, mu, lamb):
+    def dual_ineq_resid(self, mu, lamb):
         return -mu
     
-    def dual_ineq_dist(self, X, mu, lamb):
-        resids = self.dual_ineq_resid(X, mu, lamb)
+    def dual_ineq_dist(self, mu, lamb):
+        resids = self.dual_ineq_resid(mu, lamb)
         return torch.clamp(resids, 0)
 
     def dual_opt_solve(self, X, solver_type="osqp", tol=1e-6):
@@ -404,7 +448,7 @@ class OriginalQPProblem(SimpleProblem):
             mu = []
             total_time = 0
 
-            # Compute Q^-1 (numerically stable)
+            # Compute Q^-1
             Q_inv_p = np.linalg.solve(Q, p)  # Solves Q @ x = p for x = Q^-1 p
             Q_inv_A = np.linalg.solve(Q, A.T)  # Solves Q @ x = A^T
             Q_inv_G = np.linalg.solve(Q, G.T)  # Solves Q @ x = G^T
@@ -471,9 +515,106 @@ class OriginalQPProblem(SimpleProblem):
 
     def dual_calc_Y(self):
         sols_mu, sols_lamb, total_time, parallel_time = self.dual_opt_solve(self.X)
-        self.mu = torch.tensor(sols_mu)
-        self.lamb = torch.tensor(sols_lamb)
+        self._mu = torch.tensor(sols_mu)
+        self._lamb = torch.tensor(sols_lamb)
         return sols_mu, sols_lamb
+    
+class NonconvexQPProblem(SimpleProblem):
+    def __init__(self, Q, p, A, G, b, d, valid_frac=0.1, test_frac=0.1):
+        super().__init__(Q, p, A, G, b, d, valid_frac, test_frac)
+
+        self._X = self._b
+        self._num = self._X.shape[0]
+        self._neq = self._A.shape[0]
+        self._nineq = self._G.shape[0]
+        self._xdim = self._X.shape[1]
+
+        self.A_transpose = self._A.T
+        self.G_transpose = self._G.T
+
+    def obj_fn(self, X, Y):
+        return (0.5 * (Y @ self.Q) * Y + self.p * torch.sin(Y)).sum(dim=1)
+
+    def eq_resid(self, X, Y):
+        # Here, X is the RHS of the equality constraints
+        return X - Y @ self.A.T
+
+    def ineq_resid(self, X, Y):
+        return Y @ self.G.T - self.d
+    
+    def ineq_dist(self, X, Y):
+        resids = self.ineq_resid(X, Y)
+        return torch.clamp(resids, 0)
+    
+    def opt_solve(self, X, solver_type="ipopt", tol=1e-4):
+        Q, p, A, G, d = self.Q_np, self.p_np, self.A_np, self.G_np, self.d_np
+        X_np = X.detach().cpu().numpy()
+        Y = []
+        total_time = 0
+        for i, Xi in enumerate(X_np):
+            print(f"Problem: {i}/{X_np.shape[0]}")
+            if solver_type == "ipopt":
+                y0 = np.linalg.pinv(A) @ Xi  # feasible initial point
+
+                # upper and lower bounds on variables
+                lb = -np.infty * np.ones(y0.shape)
+                ub = np.infty * np.ones(y0.shape)
+
+                # upper and lower bounds on constraints
+                cl = np.hstack([Xi, -np.inf * np.ones(G.shape[0])])
+                cu = np.hstack([Xi, d])
+
+                nlp = ipopt.problem(
+                    n=len(y0),
+                    m=len(cl),
+                    problem_obj=nonconvex_ipopt(Q, p, A, G),
+                    lb=lb,
+                    ub=ub,
+                    cl=cl,
+                    cu=cu,
+                )
+
+                nlp.addOption("tol", tol)
+                nlp.addOption("print_level", 0)  # 3)
+
+                start_time = time.time()
+                y, info = nlp.solve(y0)
+                end_time = time.time()
+                Y.append(y)
+                total_time += end_time - start_time
+            else:
+                raise NotImplementedError
+
+        return np.array(Y), total_time, total_time / len(X_np)
+
+    def calc_Y(self):
+        Y = self.opt_solve(self.X)[0]
+        feas_mask = ~np.isnan(Y).all(axis=1)
+        self._num = feas_mask.sum()
+        self._X = self._X[feas_mask]
+        self._Y = torch.tensor(Y[feas_mask])
+        return Y
+
+
+class nonconvex_ipopt(object):
+    def __init__(self, Q, p, A, G):
+        self.Q = Q
+        self.p = p
+        self.A = A
+        self.G = G
+        self.tril_indices = np.tril_indices(Q.shape[0])
+
+    def objective(self, y):
+        return 0.5 * (y @ self.Q @ y) + self.p @ np.sin(y)
+
+    def gradient(self, y):
+        return self.Q @ y + (self.p * np.cos(y))
+
+    def constraints(self, y):
+        return np.hstack([self.A @ y, self.G @ y])
+
+    def jacobian(self, y):
+        return np.concatenate([self.A.flatten(), self.G.flatten()])
 
 class QPProblemVaryingG(SimpleProblem):
     def __init__(self, X, Q, p, A, G, b, d, row_indices, col_indices, valid_frac=0.1, test_frac=0.1):
@@ -542,6 +683,91 @@ class QPProblemVaryingG(SimpleProblem):
 
             sols = np.array(Y)
             parallel_time = total_time / len(G)
+
+        else:
+            raise NotImplementedError
+
+        return sols, total_time, parallel_time
+
+    def calc_Y(self):
+        Y = self.opt_solve(self.X)[0]
+        feas_mask = ~np.isnan(Y).all(axis=1)
+        self._num = feas_mask.sum()
+        self._X = self._X[feas_mask]
+        self._Y = torch.tensor(Y[feas_mask])
+        return Y
+
+class QPProblemVaryingQ(SimpleProblem):
+    def __init__(self, X, Q, p, A, G, b, d, indices, valid_frac=0.1, test_frac=0.1):
+        super().__init__(Q, p, A, G, b, d, valid_frac, test_frac)
+        # X are the varying values of G
+        self._X = X
+        self._num = self._X.shape[0]
+        self._neq = self._A.shape[0]
+        self._nineq = self._G.shape[0]
+        self._xdim = self._X.shape[1]
+
+        # Q is diagonal matrix, so indices are the same for both row and column.
+        self.row_indices = indices
+        self.col_indices = indices
+
+    def obj_fn(self, X, Y):
+        Q = self.Q.expand(Y.shape[0], -1, -1).clone()
+        Q[:, self.row_indices, self.col_indices] = X
+        quadratic_term = torch.einsum('bi,bij,bj->b', Y, Q, Y)
+        return 0.5 * quadratic_term + (self.p * Y).sum(dim=1)
+
+    def eq_resid(self, X, Y):
+        # Here, X is the RHS of the equality constraints
+        return X - Y @ self.A.T
+
+    def ineq_resid(self, X, Y):
+        return Y @ self.G.T - self.d
+    
+    def ineq_dist(self, X, Y):
+        resids = self.ineq_resid(X, Y)
+        return torch.clamp(resids, 0)
+    
+    def opt_solve(self, X, solver_type="osqp", tol=1e-4):
+        """We change op_solve so that the varying G matrices are taken from the input X.
+        """
+        if solver_type == "osqp":
+            print("running osqp")
+            p, b, d = self.p_np, self.b_np, self.d_np
+            Q = self.Q.expand(X.shape[0], -1, -1).clone()
+            Q[:, self.row_indices, self.col_indices] = X
+            G = self.G_np
+            A = self.A_np
+            Y = []
+            total_time = 0
+
+            for Qi in Q:
+                
+                solver = osqp.OSQP()
+                my_A = np.vstack([A, G])
+                my_l = np.hstack([b, -np.ones(d.shape[0]) * np.inf])
+                my_u = np.hstack([b, d])
+                solver.setup(
+                    P=csc_matrix(Qi),
+                    q=p,
+                    A=csc_matrix(my_A),
+                    l=my_l,
+                    u=my_u,
+                    verbose=False,
+                    eps_prim_inf=tol,
+                )
+                start_time = time.time()
+                results = solver.solve()
+                end_time = time.time()
+
+                total_time += end_time - start_time
+                if results.info.status == "solved":
+                    Y.append(results.x)
+                else:
+                    Y.append(np.ones(self.ydim) * np.nan)
+
+            sols = np.array(Y)
+            parallel_time = total_time / len(Q)
 
         else:
             raise NotImplementedError
